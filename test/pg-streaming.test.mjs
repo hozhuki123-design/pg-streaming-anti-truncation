@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { preparePgRequest, transformCustomIncludeBody, stripGenerationConfigFromExclude, buildRescueRequestBody, dedupeContinuationOverlap, resolveLocalGenerateUrl, hasPresetReplyTool } from "../src/request.mjs";
-import { restorePgResponse, readRescueFunctionResponse, PgJsonRestorer, StreamingFlatJsonParser, createTagStop, sseData } from "../src/json-stream.mjs";
+import { preparePgRequest, transformCustomIncludeBody, stripGenerationConfigFromExclude, buildRescueRequestBody, dedupeContinuationOverlap, resolveLocalGenerateUrl, hasPresetReplyTool, estimateRequestContextBytes } from "../src/request.mjs";
+import { restorePgResponse, readRescueFunctionResponse, formatFunctionCallArgs, detectOpenWrapperTag, PgJsonRestorer, StreamingFlatJsonParser, createTagStop, sseData } from "../src/json-stream.mjs";
 import { sanitizeMakerSuiteSchema, detectTransportTarget } from "../src/schema.mjs";
 
 const DEFAULT_SETTINGS = {
@@ -390,9 +390,19 @@ async function readRestoredSse(response) {
   assert.equal(g4.thinkingApplied, "low");
   assert.equal(g4.thinkingDowngradedFrom, "minimal");
   assert.ok(g4.preprocessedBody, "must still emit preprocessedBody on bypassed plain preset");
-  assert.equal(g4.preprocessedBody.max_tokens, 65535, "must cap 500000 -> 65535");
+  assert.equal(g4.preprocessedBody.max_tokens, 32768, "must cap gemini-4-carbon 500000 -> 32768");
   assert.ok(g4.preprocessedBody.custom_include_body.includes("reasoningEffort: low"));
   assert.ok(!g4.preprocessedBody.custom_include_body.includes("reasoning_effort: none"));
+
+  // Gemini 4 Neon preserves 65535 cap
+  const g4Neon = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-neon",
+    stream: true,
+    max_tokens: 500000,
+    messages: [{ role: "user", content: "hi" }],
+  }, { ...DEFAULT_SETTINGS, thinkingEffort: "low" });
+  assert.equal(g4Neon.preprocessedBody.max_tokens, 65535, "must cap gemini-4-neon 500000 -> 65535");
 
   // Gemini 2.5 uses body.reasoning_effort and cleans custom_include_body
   const g25 = preparePgRequest({
@@ -1221,9 +1231,9 @@ async function readRestoredSse(response) {
   console.log("[PASS] 40. v1.4.1 Preset reasoning_effort auto-bridges to Gemini 4 (streaming & native-fc)");
 }
 
-// 41. v1.4.1 Preset bridge respects explicit custom_include_body reasoning key and ignores 'auto'
+// 41. v1.5.0 Placeholder reasoning_effort: none does NOT block host bridge, while explicit active reasoning_effort IS respected & normalized
 {
-  const withCustom = preparePgRequest({
+  const withPlaceholderNone = preparePgRequest({
     chat_completion_source: "makersuite",
     model: "gemini-4-carbon",
     stream: true,
@@ -1231,8 +1241,19 @@ async function readRestoredSse(response) {
     messages: [{ role: "user", content: "hi" }],
     tools: [{ type: "function", function: { name: "response_body", parameters: { type: "object", properties: { content: { type: "string" } } } } }],
   }, { ...DEFAULT_SETTINGS, thinkingEffort: "preset" }, null, { hostReasoningEffort: "low" });
-  assert.equal(withCustom.thinkingApplied, null, "must NOT overwrite explicit custom_include_body reasoning key");
-  assert.ok(withCustom.body.custom_include_body.includes("reasoning_effort: none"));
+  assert.equal(withPlaceholderNone.thinkingApplied, "low", "placeholder reasoning_effort: none must NOT block bridging host low");
+  assert.ok(withPlaceholderNone.body.custom_include_body.includes("reasoningEffort: low"));
+
+  const withExplicitHigh = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    custom_include_body: "reasoning_effort: high",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ type: "function", function: { name: "response_body", parameters: { type: "object", properties: { content: { type: "string" } } } } }],
+  }, { ...DEFAULT_SETTINGS, thinkingEffort: "preset" }, null, { hostReasoningEffort: "low" });
+  assert.equal(withExplicitHigh.thinkingApplied, "high", "explicit active custom_include_body reasoning must be respected");
+  assert.ok(withExplicitHigh.body.custom_include_body.includes("reasoningEffort: high"));
 
   const withAuto = preparePgRequest({
     chat_completion_source: "makersuite",
@@ -1242,7 +1263,263 @@ async function readRestoredSse(response) {
     tools: [{ type: "function", function: { name: "soliumbra_reply", parameters: { type: "object", properties: { game_content: { type: "string" } } } } }],
   }, { ...DEFAULT_SETTINGS, thinkingEffort: "preset" }, null, { hostReasoningEffort: "auto" });
   assert.equal(withAuto.thinkingApplied, null, "auto must not inject reasoningEffort");
-  console.log("[PASS] 41. v1.4.1 Preset bridge preserves explicit custom_include_body & ignores auto");
+  console.log("[PASS] 41. v1.5.0 Placeholder none bridges host effort; explicit active tier respected; auto ignored");
 }
 
-console.log("\nALL 41 TEST SUITES PASSED!");
+// 42. v1.5.0 Rescue request builder: clean messages, aux context preserved, concise desc, 16384 cap, low forced on continue, continue merge
+{
+  const body = {
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    max_tokens: 65535,
+    custom_exclude_body: "generationConfig\ntools\nseed",
+    messages: [
+      { role: "system", content: "Call the `response_body` function exactly once." },
+      { role: "user", content: [{ type: "text", text: "记得调用一次 response_body 输出" }] },
+      { role: "tool", name: "context", tool_call_id: "c1", content: JSON.stringify({ instruction: "请调用 response_body 写出回复" }) },
+    ],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "response_body",
+          description: "【4ACH】" + "规".repeat(34000),
+          parameters: { type: "object", properties: { content: { type: "string" } }, required: ["content"] },
+        },
+      },
+      { type: "function", function: { name: "context", parameters: { type: "object", properties: { query: { type: "string" } } } } },
+    ],
+  };
+  const prep = preparePgRequest(body, { ...DEFAULT_SETTINGS, thinkingEffort: "high" });
+  const built = buildRescueRequestBody(prep, { ...DEFAULT_SETTINGS, thinkingEffort: "high" }, {
+    mode: "continue",
+    reason: "PROHIBITED_CONTENT",
+    collectedText: "已写正文……",
+  });
+  for (const m of built.body.messages) {
+    const s = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+    assert.ok(!s.includes("不要调用工具") && !s.includes("JSON 对象") && !s.includes("response_body"), `stale/poisoned rescue msg: ${s.slice(0, 120)}`);
+  }
+  const names = built.body.tools.map(t => t.function?.name);
+  assert.ok(names.includes("continuation_reply") && names.includes("context"), `must keep context + continuation_reply, got ${names}`);
+  const contFn = built.body.tools.find(t => t.function?.name === "continuation_reply");
+  assert.ok(contFn.function.description.length <= 2000, "continuation_reply description must be concise");
+  assert.ok(built.body.max_tokens <= 16384, `continue max_tokens capped <=16384, got ${built.body.max_tokens}`);
+  assert.match(String(built.body.custom_include_body), /reasoningEffort["']?\s*:\s*["']?low/i, "continue rescue forces low on Gemini 4");
+  assert.ok(!String(built.body.custom_exclude_body).includes("generationConfig") && !String(built.body.custom_exclude_body).includes("tools"));
+
+  // type: continue merges trailing assistant cleanly
+  const prepCont = preparePgRequest({
+    ...body,
+    type: "continue",
+    messages: [{ role: "user", content: "继续" }, { role: "assistant", content: "<game>\n第一段" }],
+  }, DEFAULT_SETTINGS);
+  const builtCont = buildRescueRequestBody(prepCont, DEFAULT_SETTINGS, { mode: "continue", reason: "PROHIBITED_CONTENT", collectedText: "，第二段" });
+  const roles = builtCont.body.messages.map(m => m.role);
+  for (let i = 1; i < roles.length; i++) assert.ok(!(roles[i - 1] === "assistant" && roles[i] === "assistant"));
+  assert.ok(builtCont.body.messages.find(m => m.role === "assistant").content.includes("第一段，第二段"));
+  console.log("[PASS] 42. v1.5.0 Clean rescue builder (aux context, concise desc, 16k cap, low continue, no poison)");
+}
+
+// 43. v1.5.0 Short <think_nya> cutoff switches to full-fallback with lossless splicing & buffered 503 preserves error
+{
+  const meowBody = {
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    messages: [{ role: "user", content: "继续" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "soliumbra_reply",
+          parameters: { type: "object", properties: { think_nya: { type: "string" }, game_content: { type: "string" } }, required: ["think_nya", "game_content"] },
+        },
+      },
+      { type: "function", function: { name: "context", parameters: { type: "object", properties: { query: { type: "string" } } } } },
+    ],
+  };
+  const prep = preparePgRequest(meowBody, DEFAULT_SETTINGS);
+  let seenMode = null;
+  const out = await readRestoredSse(await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ text: '{"think_nya":"喵呜先梳理剧情' }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "PROHIBITED_CONTENT" }] },
+    ]),
+    prep,
+    undefined,
+    () => {},
+    async ctx => {
+      seenMode = ctx.mode;
+      return { text: "<think_nya>\n完整重思。\n</think_nya><!--</think>-->\n<game>\n完整正文。\n</game>", finishReason: "STOP" };
+    },
+  ));
+  assert.equal(seenMode, "full-fallback");
+  assert.equal((out.text.match(/<think_nya>/g) || []).length, 1);
+  assert.equal((out.text.match(/<\/think_nya><!--<\/think>-->/g) || []).length, 1);
+  assert.ok(out.text.includes("<game>\n完整正文。\n</game>"));
+
+  // Buffered short cutoff -> full-fallback 503 must return HTTP 503 (never leak stale \n</game> as HTTP 200)
+  const prepBuf = preparePgRequest({ ...meowBody, stream: false }, { ...DEFAULT_SETTINGS, mode: "buffered" });
+  const resBuf = await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ text: '{"think_nya":"思","game_content":"极短' }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "PROHIBITED_CONTENT" }] },
+    ]),
+    prepBuf,
+    undefined,
+    () => {},
+    async () => { throw new Error("接力请求失败（状态码 503）"); },
+  );
+  assert.equal(resBuf.status, 503);
+  console.log("[PASS] 43. v1.5.0 Short <think_nya> full-fallback lossless splice & buffered 503 error preservation");
+}
+
+// 44. v1.5.0 Strict [DONE] ordering, no fake STOP on error/502 HTML, 2nd rescue failure & mid-rescue error handling
+{
+  const meowBody = {
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    messages: [{ role: "user", content: "写" }],
+    tools: [{ type: "function", function: { name: "soliumbra_reply", parameters: { type: "object", properties: { think_nya: { type: "string" }, game_content: { type: "string" } } } } }],
+  };
+  const prep = preparePgRequest(meowBody, DEFAULT_SETTINGS);
+
+  // MAX_TOKENS 0 visible chars + [DONE] -> single [DONE] strictly last
+  const resMax = await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ thought: true, text: "长思考" }] }, finishReason: "MAX_TOKENS" }] },
+      "data: [DONE]\n\n",
+    ]),
+    prep,
+    undefined,
+    () => {},
+    async () => ({ text: "<think_nya>\n思\n</think_nya><!--</think>-->\n<game>正文</game>", finishReason: "STOP" }),
+  );
+  const outMax = await readRestoredSse(resMax);
+  assert.equal(outMax.events.filter(e => e === "[DONE]").length, 1);
+  assert.equal(outMax.events.at(-1), "[DONE]");
+  assert.equal(outMax.finishReason, "STOP");
+
+  // Streaming non-JSON 502 HTML -> emits error frame, no fake STOP, no blind EMPTY_STOP rescue
+  let rescueHit = false;
+  const out502 = await readRestoredSse(await restorePgResponse(
+    makeSseResponse(["data: <html>502 Bad Gateway</html>\n\n"]),
+    prep,
+    undefined,
+    () => {},
+    async () => { rescueHit = true; return { text: "bad", finishReason: "STOP" }; },
+  ));
+  assert.equal(rescueHit, false);
+  assert.equal(out502.finishReason, null);
+  assert.ok(out502.events.some(e => e?.error?.code === 502));
+
+  // 2 consecutive rescues where attempt 2 fails -> no stale </think_nya> inside <game>, closes </game> cleanly
+  const out2 = await readRestoredSse(await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ text: '{"think_nya":"' + "思考".repeat(90) }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "PROHIBITED_CONTENT" }] },
+    ]),
+    prep,
+    undefined,
+    () => {},
+    async ctx => {
+      if (ctx.attempt === 1) return { text: "完毕。\n</think_nya><!--</think>-->\n<game>\n正文半段", finishReason: "PROHIBITED_CONTENT" };
+      const err = new Error("接力超时（180秒）");
+      err.name = "AbortError";
+      err.isRescueTimeout = true;
+      throw err;
+    },
+  ));
+  assert.equal((out2.text.match(/<\/think_nya>/g) || []).length, 1);
+  assert.ok(out2.text.endsWith("</game>"));
+  assert.equal(out2.finishReason, "PROHIBITED_CONTENT");
+  console.log("[PASS] 44. v1.5.0 Strict [DONE] ordering, 502 HTML guard & 2nd rescue timeout/close safety");
+}
+
+// 45. v1.5.0 Raw <game> triple-dedupe without mid-sentence newline, aux context reject, options:null, surrogate chunking, thoughtSignature & tools context size
+{
+  // Aux tool rejected + progress reported
+  const progress = [];
+  const parsed = await readRescueFunctionResponse(
+    makeSseResponse([
+      ": keepalive\n\n",
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ thought: true, text: "思考中" }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ functionCall: { name: "context", args: { query: "sync" } } }, { functionCall: { name: "continuation_reply", args: { content: "续文" } } }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }] },
+    ]),
+    { kind: "single-field", toolName: "continuation_reply", fieldName: "content" },
+    undefined,
+    info => progress.push(info),
+  );
+  assert.equal(parsed.text, "续文");
+  assert.ok(progress.some(p => p.thoughtChars > 0));
+
+  // Raw <game> triple dedupe + no mid-sentence newline
+  const prep = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    messages: [{ role: "user", content: "写" }],
+    tools: [{ type: "function", function: { name: "soliumbra_reply", parameters: { type: "object", properties: { think_nya: { type: "string" }, game_content: { type: "string" } } } } }],
+  }, DEFAULT_SETTINGS);
+  const outTriple = await readRestoredSse(await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ text: '{"think_nya":"原思","game_content":"<game>\\n另一只手则条件' }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "PROHIBITED_CONTENT" }] },
+    ]),
+    prep,
+    undefined,
+    () => {},
+    async () => ({ text: "<think_nya>\n重复\n</think_nya><!--</think>-->\n<game>另一只手则条件反射地探下来。\n</game>", finishReason: "STOP" }),
+  ));
+  assert.equal((outTriple.text.match(/<think_nya>/g) || []).length, 1);
+  assert.equal((outTriple.text.match(/<game>/g) || []).length, 1);
+  assert.ok(outTriple.text.includes("另一只手则条件反射地探下来。"));
+
+  // Pure-duplicate rescue (only repeats <think_nya>, 0 new chars after stitch) safely fails & closes </game> without faking STOP
+  const dupDone = [];
+  const outDupOnly = await readRestoredSse(await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ text: '{"think_nya":"原思","game_content":"<game>\\n已写一半' }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "PROHIBITED_CONTENT" }] },
+    ]),
+    prep,
+    undefined,
+    ev => { if (ev.phase === "done") dupDone.push(ev); },
+    async () => ({ text: "<think_nya>\n纯复读思考\n</think_nya><!--</think>-->", finishReason: "STOP" }),
+  ));
+  assert.ok(outDupOnly.text.endsWith("</game>"), "pure-duplicate rescue must still close </game>");
+  assert.equal(outDupOnly.finishReason, "PROHIBITED_CONTENT", "pure-duplicate rescue must NOT fake STOP");
+  assert.equal(dupDone[0]?.rescuedCount, 0);
+
+  // options: null live flush + self-closing tag ignore + streaming/FC parity + estimateRequestContextBytes includes tools
+  const rNull = new PgJsonRestorer({ kind: "soliumbra", schema: { properties: { think_nya: { type: "STRING" }, game_content: { type: "STRING" }, options: { type: "STRING", nullable: true }, summary: { type: "STRING" } } } });
+  rNull.feed('{"think_nya":"思","game_content":"<game>正</game>","options":null,');
+  assert.ok(rNull.feed('"summary":"实时摘要"}').includes("<summary>\n实时摘要\n</summary>"));
+  assert.equal(detectOpenWrapperTag("<game />\n正文", { kind: "soliumbra" }), null);
+  assert.equal(detectOpenWrapperTag("<story>\n半段", { kind: "soliumbra" }), "story");
+
+  const statusVal = "<status>HP:100</status>\n清晨六点十分。";
+  const rParity = new PgJsonRestorer({ kind: "soliumbra", schema: { properties: { game_content: { type: "STRING" } } } });
+  const streamedParity = rParity.feed(JSON.stringify({ game_content: statusVal })) + rParity.finish();
+  const fcParity = formatFunctionCallArgs({ name: "soliumbra_reply", args: { game_content: statusVal } }, { kind: "soliumbra", schema: { properties: { game_content: { type: "STRING" } } } });
+  assert.equal(streamedParity, fcParity);
+  assert.ok(estimateRequestContextBytes({ messages: [{ role: "user", content: "hi" }], tools: [{ function: { description: "x".repeat(60000) } }] }) > 50000);
+  console.log("[PASS] 45. v1.5.0 Aux tool guard, triple-dedupe, options:null, self-closing tag, parity & tools bytes");
+}
+
+// 46. v1.5.0 Manifest hooks.update + loading_order=0 + mobile top-center pill CSS checks
+{
+  const extDir = path.resolve(import.meta.dirname, "..");
+  const manifest = JSON.parse(fs.readFileSync(path.join(extDir, "manifest.json"), "utf8"));
+  assert.equal(manifest.loading_order, 0);
+  assert.equal(manifest.hooks?.update, "onExtensionUpdate");
+  const css = fs.readFileSync(path.join(extDir, "style.css"), "utf8");
+  assert.ok(css.includes("--tt-inset-top") && css.includes("translateX(-50%)") && css.includes(".pg-title-group") && css.includes("box-sizing: border-box"));
+  console.log("[PASS] 46. v1.5.0 Manifest loading_order=0, hooks.update & mobile top-center pill CSS");
+}
+
+console.log("\nALL 46 TEST SUITES PASSED!");

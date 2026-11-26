@@ -6,6 +6,9 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Hozhuki / Antigravity",
-  "version": "1.4.1",
-  "homePage": "https://github.com/hozhuki123-design/pg-streaming-anti-truncation"
+  "version": "1.5.0",
+  "homePage": "https://github.com/hozhuki123-design/pg-streaming-anti-truncation",
+  "hooks": {
+    "update": "onExtensionUpdate"
+  }
 }

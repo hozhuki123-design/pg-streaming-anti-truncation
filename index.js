@@ -3,6 +3,7 @@ import {
   VALID_THINKING_EFFORTS,
   resolveLocalGenerateUrl,
   hasPresetReplyTool,
+  estimateRequestContextBytes,
   preparePgRequest,
   buildRescueRequestBody,
   dedupeContinuationOverlap,
@@ -11,10 +12,12 @@ import { restorePgResponse, readRescueFunctionResponse } from "./src/json-stream
 import { installPgMeowPreview } from "./src/meow-preview.mjs";
 
 const PLUGIN_ID = "pg-streaming-anti-truncation";
+export const PLUGIN_VERSION = "1.5.0";
 const FETCH_KEY = Symbol.for("pg-streaming-anti-truncation.fetch");
 
 const TAG_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.:~-]{0,63}$/;
 const TOOL_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
+const HOST_PLACEHOLDER_EFFORTS = new Set(["", "auto", "none", "off", "default", "disabled", "disable"]);
 
 const DEFAULT_SETTINGS = {
   mode: "streaming",         // off | streaming | buffered | native-fc
@@ -94,14 +97,49 @@ const context = SillyTavern.getContext();
 const events = context.eventTypes ?? context.event_types;
 let statusEl = null;
 let presetHintEl = null;
+let runtimeSummaryEl = null;
 let rescuePillEl = null;
 let meowStreams = null;
 let activeMainReqId = 0;
 let inFlightMainReqId = null;
 let inFlightMainSignal = null;
+let mainGenActive = false;
+let mainGenStartedAt = 0;
 let stopActiveWaitTimer = null;
+let pillAutoHideTimer = null;
+let pillStickyUntil = 0;
+let pillSeq = 0;
+let lastSettingsReadyEffort = null;
+let lastSettingsReadyAt = 0;
 let lastStatus = { text: "", tone: "info" };
 let globalListenersBound = false;
+
+// TauriTavern 单扩展更新钩子（manifest.hooks.update）：更新后立刻提示并自动刷新加载新版 JS，解决手机端旧内存滞留
+export function onExtensionUpdate() {
+  try {
+    const busy = inFlightMainReqId !== null && !inFlightMainSignal?.aborted;
+    const msg = busy
+      ? "PG 流式抗截断已完成更新，当前生成结束后请刷新页面以加载新版。"
+      : "PG 流式抗截断已完成更新，正在刷新页面以加载新版…";
+    if (globalThis.toastr?.info) {
+      globalThis.toastr.info(msg, "PG 流式抗截断");
+    } else if (window?.toastr?.info) {
+      window.toastr.info(msg, "PG 流式抗截断");
+    }
+    setStatus(msg, "info");
+    if (!busy) {
+      setTimeout(() => {
+        try {
+          window?.location?.reload?.();
+        } catch {
+          // ignore reload failure in non-browser environment
+        }
+      }, 1200);
+    }
+  } catch {
+    // never crash extension updater
+  }
+}
 
 function ensureMeowPreview() {
   if (meowStreams) return meowStreams;
@@ -151,16 +189,31 @@ function setStatus(text, tone = "info", reqId = null) {
   el.classList.toggle("pg-status-warn", tone === "warn");
 }
 
-// 聊天界面右下角轻提示小胶囊（电脑与手机端均适用，只在触发防截断无感接力时浮出，结束立即隐藏）
-function setRescuePill(text, reqId = null) {
+function clearPillTimer() {
+  if (pillAutoHideTimer !== null) {
+    clearTimeout(pillAutoHideTimer);
+    pillAutoHideTimer = null;
+  }
+}
+
+// 聊天界面顶部居中轻提示胶囊（适配电脑端与 Android/iOS 刘海屏，避开右下角小猫悬浮球/4ACH 胶囊/底部输入法）
+function setRescuePill(text, reqId = null, { tone = "warn", autoHideMs = 0, force = false } = {}) {
   if (reqId !== null && reqId !== activeMainReqId) return;
   if (!text) {
+    if (!force && pillStickyUntil > performance.now()) return;
+    pillSeq++;
+    clearPillTimer();
+    pillStickyUntil = 0;
     if (rescuePillEl) {
       rescuePillEl.textContent = "";
       rescuePillEl.hidden = true;
+      rescuePillEl.classList.remove("pg-pill-info", "pg-pill-error");
     }
     return;
   }
+  const mySeq = ++pillSeq;
+  clearPillTimer();
+  pillStickyUntil = autoHideMs > 0 ? performance.now() + autoHideMs : 0;
   if (!rescuePillEl?.isConnected) {
     const existing = document.getElementById("pg_rescue_floating_pill");
     if (existing) {
@@ -174,8 +227,34 @@ function setRescuePill(text, reqId = null) {
     }
   }
   if (!rescuePillEl) return;
+  rescuePillEl.classList.toggle("pg-pill-info", tone === "info");
+  rescuePillEl.classList.toggle("pg-pill-error", tone === "error");
   rescuePillEl.textContent = text;
   rescuePillEl.hidden = false;
+  if (autoHideMs > 0) {
+    pillAutoHideTimer = setTimeout(() => {
+      if (pillSeq !== mySeq) return;
+      pillAutoHideTimer = null;
+      pillStickyUntil = 0;
+      setRescuePill("", null, { force: true });
+    }, autoHideMs);
+  }
+}
+
+function formatHttpStatusError(status) {
+  const map = {
+    400: "请求参数被上游拒绝，请检查模型或附加参数",
+    401: "API 密钥无效或未授权",
+    403: "账号无权限访问该模型或触发地区/配额限制",
+    404: "所选模型不存在或接口路径错误",
+    408: "上游请求超时",
+    429: "触发上游限流或额度已满，请稍后再试",
+    500: "上游服务内部错误",
+    502: "反代或上游网关异常，可稍后重发",
+    503: "上游服务繁忙/暂不可用（模型节点拥堵），可点重发",
+    504: "上游响应超时，建议改低思考或稍后重发",
+  };
+  return map[status] ? `状态码 ${status}：${map[status]}` : `状态码 ${status}`;
 }
 
 function localizeNetworkError(errOrMsg) {
@@ -184,8 +263,13 @@ function localizeNetworkError(errOrMsg) {
   if (/failed to fetch|network\s*error|load failed|socket|econnreset|econnrefused|epipe/i.test(msg)) {
     return "网络连接异常或代理中断，请确认反代服务运行正常";
   }
-  if (/timeout|timed out/i.test(msg)) return "请求连接超时";
+  if (/timeout|timed out|超时/i.test(msg)) {
+    return /超时/.test(msg) ? msg.slice(0, 160) : "请求连接超时";
+  }
   if (/aborted|abort/i.test(msg)) return "请求已中止";
+  if (/503|service.*unavailable/i.test(msg) && !/拥堵|繁忙|暂不可用/.test(msg)) {
+    return `${msg.slice(0, 120)}（上游节点拥堵/暂不可用，可重发）`;
+  }
   return msg.slice(0, 160);
 }
 
@@ -212,6 +296,14 @@ function formatTargetLabel(target) {
   return "内置结构化真流式";
 }
 
+function formatContextMetrics(body) {
+  const bytes = estimateRequestContextBytes(body);
+  const kb = Math.max(1, Math.round(bytes / 1024));
+  const msgArr = Array.isArray(body?.messages) ? body.messages : [];
+  const turns = Math.max(1, msgArr.filter(m => m?.role === "user" || m?.role === "assistant").length);
+  return { kb, turns, label: `${turns} 轮上下文 · 约 ${kb} KB` };
+}
+
 function readTagStopRule(s) {
   if (!s.tagStop) return null;
   const tag = String(s.stopTag ?? "").trim();
@@ -223,23 +315,80 @@ function readTagStopRule(s) {
   return { tag, count, exemptTag };
 }
 
-// 判别是否为非 quiet 的后台扩展请求（如记忆增强 generateRaw、小白X后台辅助调用）：
-// 1) 若旧主请求仍在进行且未被手动中止，并发进入的次级请求 100% 为后台请求；
-// 2) 无活跃 streamingProcessor、无 type、stream === false 而宿主开启流式、且未携带正文工具（如 soliumbra_reply）的请求视作后台调用；
-// 注：绝不能因历史 quiet 任务触发过 GENERATION_ENDED 就误判后续主生成为后台请求（修复手机端静默漏拦截）。
+function isReasoningOmittedByHost() {
+  const omit = SillyTavern.getContext()?.chatCompletionSettings?.extensions?.tauritavern?.omit_params;
+  return Array.isArray(omit) && omit.includes("reasoning_effort");
+}
+
+function readHostReasoningEffort({ consumeSnapshot = false } = {}) {
+  if (isReasoningOmittedByHost()) {
+    if (consumeSnapshot) {
+      lastSettingsReadyEffort = null;
+      lastSettingsReadyAt = 0;
+    }
+    return null;
+  }
+  // 1. 优先读取本次生成触发的 CHAT_COMPLETION_SETTINGS_READY 快照（30 秒有效，发包时一次性消费）
+  if (lastSettingsReadyEffort && (performance.now() - lastSettingsReadyAt) <= 30000) {
+    const snap = lastSettingsReadyEffort;
+    if (consumeSnapshot) {
+      lastSettingsReadyEffort = null;
+      lastSettingsReadyAt = 0;
+    }
+    if (!HOST_PLACEHOLDER_EFFORTS.has(snap.toLowerCase())) {
+      return snap;
+    }
+  } else if (consumeSnapshot) {
+    lastSettingsReadyEffort = null;
+    lastSettingsReadyAt = 0;
+  }
+  // 2. DOM 控件值仅在非占位值（非 auto/none/空串）时优先，避免 DOM 滞留 auto 遮蔽真实设置
+  const sel = document.getElementById("openai_reasoning_effort");
+  const fromDom = typeof sel?.value === "string" ? sel.value.trim() : "";
+  if (fromDom && !HOST_PLACEHOLDER_EFFORTS.has(fromDom.toLowerCase())) {
+    return fromDom;
+  }
+  // 3. 回退 chatCompletionSettings.reasoning_effort
+  const fromSettings = SillyTavern.getContext()?.chatCompletionSettings?.reasoning_effort;
+  const trimmedSettings = typeof fromSettings === "string" ? fromSettings.trim() : "";
+  if (trimmedSettings && !HOST_PLACEHOLDER_EFFORTS.has(trimmedSettings.toLowerCase())) {
+    return trimmedSettings;
+  }
+  return fromDom || trimmedSettings || null;
+}
+
+// 判别是否为非 quiet 的后台扩展请求（如 st-memory-enhancement generateRaw、LittleWhiteBox 后台辅助摘要）：
+// 1) 若主请求仍在进行且未被手动中止，并发进入的次级请求 100% 为后台请求；
+// 2) 若当前处于主生成流程（GENERATION_STARTED 或活跃 streamingProcessor 或明确主生成 type），视为真实主请求；
+// 3) 若未经主生成流程：无工具请求（如 generateRaw(stream:true)）或宿主开流式但请求 stream:false，视作后台静默请求。
+function formatHostEffortLabel(raw) {
+  const low = String(raw ?? "").trim().toLowerCase();
+  if (!low || HOST_PLACEHOLDER_EFFORTS.has(low)) return "";
+  if (low === "min" || low === "minimal") return THINKING_LABEL.minimal;
+  if (low === "low") return THINKING_LABEL.low;
+  if (low === "medium" || low === "med") return THINKING_LABEL.medium;
+  if (low === "high" || low === "xhigh" || low === "extra_high" || low === "max" || low === "maximum") {
+    return THINKING_LABEL.high;
+  }
+  return THINKING_LABEL.preset;
+}
+
 function isLikelyBackgroundRequest(body) {
-  if (body.type === "quiet" || body.type === "impersonate") return false; // 由专门分支处理
+  if (body.type === "quiet" || body.type === "impersonate") return false;
   if (inFlightMainReqId !== null && !inFlightMainSignal?.aborted) return true;
-  if (body.stream === true || hasPresetReplyTool(body)) return false;
   const ctx = SillyTavern.getContext();
   const activeProc = Boolean(ctx?.streamingProcessor && !ctx.streamingProcessor.isFinished);
+  const mainActiveFresh = mainGenActive && (performance.now() - mainGenStartedAt) <= 15_000;
+  if (mainActiveFresh || activeProc) return false;
+  if (body.type === "continue" || body.type === "regenerate" || body.type === "swipe" || body.type === "normal") {
+    return false;
+  }
   const hostStreamEl = document.getElementById("stream_toggle");
   const hostStreaming = hostStreamEl
     ? hostStreamEl.checked
     : ctx?.chatCompletionSettings?.stream_openai !== false;
-  if (!activeProc && !body.type && body.stream === false && hostStreaming) {
-    return true;
-  }
+  if (!hasPresetReplyTool(body)) return true;
+  if (body.stream === false && hostStreaming) return true;
   return false;
 }
 
@@ -261,7 +410,7 @@ async function readRequestBodyJson(input, init) {
   return null;
 }
 
-async function sendModifiedBody(originalFetch, input, init, url, payloadText) {
+async function sendModifiedBody(originalFetch, input, init, url, payloadText, overrideSignal = undefined) {
   if (input instanceof Request) {
     const source = new Request(input.clone(), init);
     const headers = new Headers(source.headers);
@@ -270,7 +419,7 @@ async function sendModifiedBody(originalFetch, input, init, url, payloadText) {
       method: "POST",
       headers,
       body: payloadText,
-      signal: source.signal,
+      signal: overrideSignal ?? source.signal,
       credentials: source.credentials,
       cache: source.cache,
       redirect: source.redirect,
@@ -280,14 +429,11 @@ async function sendModifiedBody(originalFetch, input, init, url, payloadText) {
     });
     return originalFetch(nextReq);
   }
-  return originalFetch(input, { ...init, body: payloadText });
-}
-
-function readHostReasoningEffort() {
-  const sel = document.getElementById("openai_reasoning_effort");
-  const fromDom = typeof sel?.value === "string" && sel.value ? sel.value : null;
-  const fromSettings = SillyTavern.getContext()?.chatCompletionSettings?.reasoning_effort;
-  return fromDom ?? (typeof fromSettings === "string" ? fromSettings : null);
+  return originalFetch(input, {
+    ...init,
+    body: payloadText,
+    ...(overrideSignal ? { signal: overrideSignal } : {}),
+  });
 }
 
 // 在模块加载阶段即包裹 window.fetch（loading_order: 0，早于 SPreset、小白X、JS-Slash-Runner 与预设脚本）
@@ -308,7 +454,9 @@ function installFetchInterceptor() {
 
     let body;
     try {
-      body = await readRequestBodyJson(input, init);
+      body = typeof init?.body === "string"
+        ? JSON.parse(init.body)
+        : await readRequestBodyJson(input, init);
     } catch {
       return originalFetch(input, init);
     }
@@ -318,11 +466,12 @@ function installFetchInterceptor() {
     }
 
     const isBackground = isLikelyBackgroundRequest(body);
+    const isSilentInput = isBackground || body.type === "quiet" || body.type === "impersonate";
     const tagStop = readTagStopRule(s);
-    const hostReasoningEffort = readHostReasoningEffort();
+    const hostReasoningEffort = isSilentInput ? null : readHostReasoningEffort({ consumeSnapshot: true });
     const prepared = preparePgRequest(body, s, tagStop, { isBackground, hostReasoningEffort });
 
-    // 静默后台请求（quiet / 替我说 / 并发扩展任务）：绝不写状态栏、绝不改工具，仅静默透传防 400 修正
+    // 静默后台请求（quiet / 替我说 / 并发扩展任务 / 记忆整理）：绝不写状态栏、绝不改工具，仅静默透传防 400 修正
     if (prepared.silent) {
       if (prepared.preprocessedBody) {
         const preText = JSON.stringify(prepared.preprocessedBody);
@@ -336,11 +485,15 @@ function installFetchInterceptor() {
     // 绕过结构化流式，但若前置阶段应用了思考档位或修正了超限参数，仍发送修正后的请求
     if (prepared.bypass) {
       const reqId = ++activeMainReqId;
+      mainGenActive = false;
+      setRescuePill("", reqId, { force: true });
       const baseMsg = BYPASS_TEXT[prepared.bypass];
       const extraHints = [];
       if (prepared.thinkingApplied) {
-        const downgrade = prepared.thinkingDowngradedFrom ? "（Gemini 4 自动按低思考）" : "";
+        const downgrade = prepared.thinkingDowngradedFrom ? "（Gemini 4 自动降为低思考）" : "";
         extraHints.push(`已应用${THINKING_LABEL[prepared.thinkingApplied]}${downgrade}`);
+      } else {
+        extraHints.push("未指定思考（模型默认）");
       }
       if (prepared.fixedMaxReasoning) extraHints.push("已自动修正预设超限思考参数");
       const fullMsg = [baseMsg, ...extraHints].filter(Boolean).join(" · ");
@@ -358,6 +511,8 @@ function installFetchInterceptor() {
     const payloadText = JSON.stringify(prepared.body);
     const reqId = ++activeMainReqId;
     if (new TextEncoder().encode(payloadText).length > BODY_LIMIT) {
+      mainGenActive = false;
+      setRescuePill("", reqId, { force: true });
       setStatus(BYPASS_TEXT["too-large"], "warn", reqId);
       return originalFetch(input, init);
     }
@@ -366,26 +521,33 @@ function installFetchInterceptor() {
 
     inFlightMainReqId = reqId;
     inFlightMainSignal = signal ?? null;
+    setRescuePill("", reqId, { force: true });
+
     const clearInFlight = () => {
       if (inFlightMainReqId === reqId) {
         inFlightMainReqId = null;
         inFlightMainSignal = null;
+        mainGenActive = false;
       }
     };
 
     const downgrade = prepared.thinkingDowngradedFrom ? "（自动按低思考）" : "";
-    const thinkNote = prepared.thinkingApplied ? ` · ${THINKING_LABEL[prepared.thinkingApplied]}${downgrade}` : "";
-    const modeLabel = (prepared.upstreamStream ? formatTargetLabel(prepared.target) : "非流式抗截断（整段校验）") + thinkNote;
+    const thinkShort = prepared.thinkingApplied
+      ? `${THINKING_LABEL[prepared.thinkingApplied]}${downgrade}`
+      : "未指定思考（模型默认）";
+    const ctxInfo = formatContextMetrics(body);
+    const modeLabel = `${prepared.upstreamStream ? formatTargetLabel(prepared.target) : "非流式抗截断（整段校验）"} · ${thinkShort}`;
     const hostStreamOff = prepared.mode === "streaming" && !prepared.stream;
     const startedAt = performance.now();
 
     const waitPrefix = hostStreamOff
-      ? "提示：酒馆原生「流式传输」开关未开启，本次按整段校验交付"
-      : `已启用 ${modeLabel}`;
+      ? `提示：酒馆原生「流式传输」未开启（${thinkShort} · ${ctxInfo.label}）`
+      : `已启用 ${modeLabel}（${ctxInfo.label}）`;
 
     setStatus(`${waitPrefix}，正在等待首字…`, hostStreamOff ? "warn" : "info", reqId);
 
-    // 首字前每秒刷新等待计时；若已被新请求、停止或切聊取代则自动自毁，绝不泄漏定时器
+    // 首字前每秒刷新等待计时；超过 12 秒在聊天顶部居中浮出轻提示胶囊，首字到达即隐藏
+    let waitPillActive = false;
     let waitTimer = setInterval(() => {
       if (reqId !== activeMainReqId) {
         stopWaitTimer();
@@ -393,12 +555,24 @@ function installFetchInterceptor() {
         return;
       }
       const sec = Math.max(1, Math.floor((performance.now() - startedAt) / 1000));
-      setStatus(`${waitPrefix}，正在等待首字（${sec} 秒）…`, hostStreamOff ? "warn" : "info", reqId);
+      const slowHint = sec >= 90 ? "（等待较久，可能遇慢节点，可点停止重发）" : "";
+      setStatus(`${waitPrefix}，正在等待首字（${sec} 秒）${slowHint}…`, hostStreamOff || sec >= 90 ? "warn" : "info", reqId);
+      if (sec >= 12) {
+        waitPillActive = true;
+        const pillMsg = sec >= 90
+          ? `等待首字较久（${sec} 秒 · ${thinkShort} · 约 ${ctxInfo.kb} KB，可停止重发）…`
+          : `正在等待首字（${sec} 秒 · ${thinkShort} · 约 ${ctxInfo.kb} KB）…`;
+        setRescuePill(pillMsg, reqId, { tone: sec >= 90 ? "warn" : "info" });
+      }
     }, 1000);
-    const stopWaitTimer = () => {
+    const stopWaitTimer = ({ keepPill = false } = {}) => {
       if (waitTimer !== null) {
         clearInterval(waitTimer);
         waitTimer = null;
+      }
+      if (waitPillActive && !keepPill) {
+        waitPillActive = false;
+        setRescuePill("", reqId);
       }
       if (stopActiveWaitTimer === stopWaitTimer) stopActiveWaitTimer = null;
     };
@@ -427,7 +601,7 @@ function installFetchInterceptor() {
     if (!response.ok) {
       stopWaitTimer();
       clearInFlight();
-      setStatus(`PG 上游返回错误（状态码 ${response.status}）`, "error", reqId);
+      setStatus(`PG 上游报错（${formatHttpStatusError(response.status)}）`, "error", reqId);
       return response;
     }
 
@@ -438,16 +612,22 @@ function installFetchInterceptor() {
 
     let doneHandled = false;
     let rescueTimer = null;
-    const stopRescueTimer = () => {
+    let activeRescueAbort = null;
+    const stopRescueTimer = ({ keepPill = false } = {}) => {
       if (rescueTimer !== null) {
         clearInterval(rescueTimer);
         rescueTimer = null;
       }
-      setRescuePill("", reqId);
+      if (!keepPill) setRescuePill("", reqId);
     };
     const stopAllTimers = () => {
       stopWaitTimer();
       stopRescueTimer();
+      if (activeRescueAbort) {
+        const fn = activeRescueAbort;
+        activeRescueAbort = null;
+        fn();
+      }
     };
     stopActiveWaitTimer = stopAllTimers;
 
@@ -456,10 +636,11 @@ function installFetchInterceptor() {
           stopWaitTimer();
           stopRescueTimer();
           const rescueStart = performance.now();
+          let rescueThoughtChars = 0;
           const modeDesc = rescueCtx.mode === "full-fallback"
             ? (rescueCtx.reason === "EMPTY_STOP"
-              ? "上游仅思考未出正文（假 STOP），自动切换原生函数抗截断通道补发"
-              : "0 字拦截，自动回退原生函数抗截断通道")
+              ? "上游仅思考未出正文（空回复提前结束），自动切换原生函数抗截断通道补发"
+              : "0 字或未进正文截断，自动切换原生函数抗截断通道重发")
             : rescueCtx.reason === "MISSING_BODY_STOP"
               ? "上游仅输出思维链未写正文，正在原生函数通道无感补写完整正文"
               : `检测到上游安全截断（已收 ${rescueCtx.collectedText.length} 字），正在原生函数通道无感接力续写`;
@@ -469,29 +650,100 @@ function installFetchInterceptor() {
               ? "仅出思维链，正在自动补写正文"
               : "触发安全截断，正在无感接力续写";
           setStatus(`${modeDesc}…`, "warn", reqId);
-          setRescuePill(`${pillPrefix}…`, reqId);
+          setRescuePill(`${pillPrefix}…`, reqId, { tone: "warn" });
+
           rescueTimer = setInterval(() => {
             if (reqId !== activeMainReqId) {
               stopRescueTimer();
               return;
             }
             const sec = Math.max(1, Math.floor((performance.now() - rescueStart) / 1000));
+            const thoughtTip = rescueThoughtChars > 0 ? ` · 已思考 ${rescueThoughtChars} 字` : "";
             const slowTip = sec >= 120 && rescueCtx.collectedText?.length > 0
               ? "（等待较久，可点停止保留已出正文再点继续）"
               : "";
-            setStatus(`${modeDesc}（已等待 ${sec} 秒）${slowTip}…`, "warn", reqId);
-            setRescuePill(`${pillPrefix}（已等 ${sec} 秒${sec >= 120 && rescueCtx.collectedText?.length > 0 ? "，可停止后点继续" : ""}）…`, reqId);
+            setStatus(`${modeDesc}（已等待 ${sec} 秒${thoughtTip}）${slowTip}…`, "warn", reqId);
+            setRescuePill(
+              `${pillPrefix}（已等 ${sec} 秒${thoughtTip}${sec >= 120 && rescueCtx.collectedText?.length > 0 ? "，可停止后点继续" : ""}）…`,
+              reqId,
+              { tone: "warn" },
+            );
           }, 1000);
+
+          // 接力独立超时保护（continue 180s / full-fallback 240s，单调不减截止时间，收到思考增量仅可向 300s 硬上限延长、绝不缩短）
+          const rescueAc = new AbortController();
+          const baseTimeoutMs = rescueCtx.mode === "full-fallback" ? 240_000 : 180_000;
+          const hardCapMs = 300_000;
+          let deadlineAt = rescueStart + baseTimeoutMs;
+          let timedOut = false;
+          let timeoutId = null;
+
+          const scheduleTimeout = () => {
+            if (timeoutId !== null) clearTimeout(timeoutId);
+            const waitMs = Math.max(1000, deadlineAt - performance.now());
+            timeoutId = setTimeout(() => {
+              timedOut = true;
+              rescueAc.abort();
+            }, waitMs);
+          };
+          scheduleTimeout();
+
+          activeRescueAbort = () => {
+            rescueAc.abort();
+          };
+          const onUserAbort = () => {
+            rescueAc.abort();
+          };
+          if (rescueCtx.signal) {
+            if (rescueCtx.signal.aborted) rescueAc.abort();
+            else rescueCtx.signal.addEventListener("abort", onUserAbort, { once: true });
+          }
+
           try {
             const built = buildRescueRequestBody(prepared, s, rescueCtx);
-            const rescueRes = await sendModifiedBody(originalFetch, input, init, url, JSON.stringify(built.body));
-            const parsed = await readRescueFunctionResponse(rescueRes, built.rescueTarget, rescueCtx.signal);
+            const rescueRes = await sendModifiedBody(
+              originalFetch,
+              input,
+              init,
+              url,
+              JSON.stringify(built.body),
+              rescueAc.signal,
+            );
+            const parsed = await readRescueFunctionResponse(
+              rescueRes,
+              built.rescueTarget,
+              rescueAc.signal,
+              info => {
+                if (typeof info?.thoughtChars === "number" && info.thoughtChars > rescueThoughtChars) {
+                  rescueThoughtChars = info.thoughtChars;
+                  const now = performance.now();
+                  const extended = Math.min(rescueStart + hardCapMs, now + 90_000);
+                  const nextDeadline = Math.max(deadlineAt, extended);
+                  if (nextDeadline > deadlineAt) {
+                    deadlineAt = nextDeadline;
+                    scheduleTimeout();
+                  }
+                }
+              },
+            );
             if (parsed.text && rescueCtx.mode === "continue") {
-              parsed.text = dedupeContinuationOverlap(rescueCtx.collectedText, parsed.text);
+              parsed.text = dedupeContinuationOverlap(rescueCtx.collectedText, parsed.text, rescueCtx.openWrapperTag);
             }
             return parsed;
+          } catch (err) {
+            if (timedOut && !rescueCtx.signal?.aborted) {
+              const sec = Math.round((performance.now() - rescueStart) / 1000);
+              const tErr = new Error(`接力超时（已等待 ${sec} 秒，已保留前文），可点「继续」续写`);
+              tErr.name = "AbortError";
+              tErr.isRescueTimeout = true;
+              throw tErr;
+            }
+            throw err;
           } finally {
-            stopRescueTimer();
+            activeRescueAbort = null;
+            if (timeoutId !== null) clearTimeout(timeoutId);
+            rescueCtx.signal?.removeEventListener("abort", onUserAbort);
+            stopRescueTimer({ keepPill: true });
           }
         }
       : null;
@@ -505,11 +757,17 @@ function installFetchInterceptor() {
           return;
         }
         if (info.phase === "thinking") {
-          stopWaitTimer();
+          const keepThinkingPill = waitPillActive || (info.elapsedMs >= 12_000);
+          stopWaitTimer({ keepPill: keepThinkingPill });
           const sec = (info.elapsedMs / 1000).toFixed(0);
           setStatus(`${modeLabel} · 模型思考中（已思考 ${info.thoughtChars} 字，${sec} 秒）…`, "info", reqId);
+          if (keepThinkingPill) {
+            waitPillActive = true;
+            setRescuePill(`模型思考中（已思考 ${info.thoughtChars} 字，${sec} 秒）…`, reqId, { tone: "info" });
+          }
         } else if (info.phase === "first-token") {
           stopWaitTimer();
+          setRescuePill("", reqId, { force: true });
           const tailMsg = prepared.upstreamStream ? "正在实时输出…" : "正在后台校验接收…";
           setStatus(`${modeLabel} · 首字已到达（${(info.ttftMs / 1000).toFixed(1)} 秒），${tailMsg}`, "info", reqId);
         } else if (info.phase === "streaming") {
@@ -523,22 +781,40 @@ function installFetchInterceptor() {
         } else if (info.phase === "done") {
           doneHandled = true;
           stopWaitTimer();
-          stopRescueTimer();
           clearInFlight();
           const chars = info.chars ?? 0;
           const totalSec = info.totalMs != null ? info.totalMs / 1000 : null;
           if (info.aborted) {
+            stopRescueTimer();
+            setRescuePill("", reqId, { force: true });
             setStatus(`已手动停止生成（已收 ${chars} 字，耗时 ${(totalSec ?? 0).toFixed(1)} 秒）`, "info", reqId);
             return;
           }
           if (info.errorMessage) {
-            setStatus(`PG 上游报错：${localizeNetworkError(info.errorMessage)}`, "error", reqId);
+            stopRescueTimer({ keepPill: chars > 0 });
+            const localizedErr = localizeNetworkError(info.errorMessage);
+            if (chars > 0) {
+              setStatus(`${modeLabel} · 接力异常（${localizedErr}），已保留前 ${chars} 字，可点「继续」续写`, "error", reqId);
+              setRescuePill(`接力未完成，已保留前 ${chars} 字，可点「继续」续写`, reqId, { tone: "error", autoHideMs: 8000 });
+            } else {
+              setRescuePill("", reqId, { force: true });
+              setStatus(`PG 上游报错：${localizedErr}`, "error", reqId);
+            }
             return;
           }
           if (info.blockReason) {
-            setStatus(`请求被上游安全策略拦截：${localizeReason(info.blockReason)}`, "error", reqId);
+            stopRescueTimer({ keepPill: chars > 0 });
+            if (chars > 0) {
+              setStatus(`${modeLabel} · ${localizeReason(info.blockReason)}，已保留前 ${chars} 字，可点「继续」续写`, "error", reqId);
+              setRescuePill(`已保留前 ${chars} 字，可点「继续」续写`, reqId, { tone: "error", autoHideMs: 8000 });
+            } else {
+              setRescuePill("", reqId, { force: true });
+              setStatus(`请求被上游安全策略拦截：${localizeReason(info.blockReason)}`, "error", reqId);
+            }
             return;
           }
+          stopRescueTimer();
+          setRescuePill("", reqId, { force: true });
           const genSec = info.ttftMs != null && info.totalMs != null
             ? Math.max(0.2, (info.totalMs - info.ttftMs) / 1000)
             : totalSec;
@@ -571,7 +847,7 @@ function installFetchInterceptor() {
         }
       } else if (!prepared.upstreamStream) {
         stopWaitTimer();
-        stopRescueTimer();
+        stopRescueTimer({ keepPill: pillStickyUntil > performance.now() });
         clearInFlight();
       }
       return restored;
@@ -600,8 +876,29 @@ function updatePresetHint() {
   if (!presetHintEl?.isConnected) {
     presetHintEl = document.getElementById("pg_preset_hint");
   }
-  if (!presetHintEl) return;
+  if (!runtimeSummaryEl?.isConnected) {
+    runtimeSummaryEl = document.getElementById("pg_runtime_summary");
+  }
   const s = getSettings();
+  const ctx = SillyTavern.getContext();
+  const modelSel = document.getElementById("model_google_select");
+  const curModel = String(modelSel?.value ?? ctx?.chatCompletionSettings?.google_model ?? "").trim();
+  const hostEff = String(readHostReasoningEffort({ consumeSnapshot: false }) ?? "").trim().toLowerCase();
+  const hostStream = document.getElementById("stream_toggle");
+  const isHostStreaming = hostStream ? hostStream.checked : ctx?.chatCompletionSettings?.stream_openai !== false;
+  const webSearchEl = document.getElementById("openai_enable_web_search");
+  const isWebSearch = Boolean(webSearchEl?.checked ?? ctx?.chatCompletionSettings?.enable_web_search);
+
+  if (runtimeSummaryEl) {
+    const modelShort = curModel ? curModel.replace(/^models\//, "") : "未选择模型";
+    const hostLabel = formatHostEffortLabel(hostEff);
+    const effDisplay = s.thinkingEffort !== "preset"
+      ? `${THINKING_LABEL[s.thinkingEffort]}（插件覆盖）`
+      : (hostLabel ? `${hostLabel}（预设桥接）` : "未指定（模型默认）");
+    runtimeSummaryEl.textContent = `当前：${modelShort} · 思考：${effDisplay} · ${isHostStreaming ? "流式已开" : "流式未开"}`;
+  }
+
+  if (!presetHintEl) return;
 
   if (s.mode === "off") {
     if (s.thinkingEffort !== "preset") {
@@ -613,11 +910,6 @@ function updatePresetHint() {
     }
     return;
   }
-
-  const hostStream = document.getElementById("stream_toggle");
-  const isHostStreaming = hostStream ? hostStream.checked : SillyTavern.getContext().chatCompletionSettings?.stream_openai !== false;
-  const webSearchEl = document.getElementById("openai_enable_web_search");
-  const isWebSearch = Boolean(webSearchEl?.checked ?? SillyTavern.getContext().chatCompletionSettings?.enable_web_search);
 
   let text = "";
   let warn = false;
@@ -635,17 +927,18 @@ function updatePresetHint() {
   } else if (s.mode === "buffered") {
     text = "就绪：发送时自动识别小猫 / 4ACH / 图灵 / 莱莎等工具预设并转为整段校验抗截断。";
   } else {
-    const modelSel = document.getElementById("model_google_select");
-    const curModel = String(modelSel?.value ?? SillyTavern.getContext().chatCompletionSettings?.google_model ?? "");
-    const hostEff = String(readHostReasoningEffort() ?? "").trim().toLowerCase();
     const hasLowPreset = hostEff === "low" || hostEff === "min" || hostEff === "minimal";
+    const hasExplicitPreset = hostEff === "medium" || hostEff === "med" || hostEff === "high" || hostEff === "xhigh" || hostEff === "extra_high" || hostEff === "max" || hostEff === "maximum";
+    const explicitLabel = formatHostEffortLabel(hostEff);
     const carbonTip = /gemini-4-carbon/i.test(curModel)
       ? (hasLowPreset
-        ? " 已自动桥接预设里的「低思考」到 Gemini 4，防止被脚本吞掉。"
-        : " 提示：长对话用 4c 时建议开启「低思考」，可避免首字干等超时。")
+        ? " 已自动桥接预设里的「低思考」到 Gemini 4（已自动清理预设空占位）。"
+        : hasExplicitPreset
+          ? ` 已自动桥接预设思考（${explicitLabel}）到 Gemini 4；如长对话首字慢可改低思考。`
+          : " 提示：长对话使用 Gemini 4 时建议开启「低思考」，可显著缩短首字等待。")
       : "";
     text = (s.autoRescue !== false
-      ? "就绪：真流式秒出字，如遇安全截断或仅出思维链假停，将自动切原生函数通道无感补全。"
+      ? "就绪：真流式秒出字，如遇安全截断或仅出思维链提前结束，将自动切原生函数通道无感补全。"
       : "就绪：发送时自动识别小猫 / 4ACH / 图灵 / 莱莎等工具预设并转为真流式。") + carbonTip;
   }
 
@@ -654,42 +947,95 @@ function updatePresetHint() {
   presetHintEl.classList.toggle("pg-hint-warn", warn);
 }
 
+function bindHostControlEvents() {
+  const bindings = [
+    ["stream_toggle", ["change", "input"]],
+    ["openai_enable_web_search", ["change", "input"]],
+    ["model_google_select", ["change", "input"]],
+    ["openai_reasoning_effort", ["change", "input"]],
+    ["chat_completion_source", ["change", "input"]],
+  ];
+  for (const [id, evList] of bindings) {
+    const el = document.getElementById(id);
+    if (!el || el.dataset?.pgHintBound) continue;
+    if (el.dataset) el.dataset.pgHintBound = "1";
+    for (const ev of evList) {
+      el.addEventListener(ev, updatePresetHint);
+    }
+  }
+}
+
 function bindGlobalListenersOnce() {
   if (globalListenersBound) return;
   globalListenersBound = true;
 
-  const resetInFlight = () => {
+  const resetInFlight = ({ forceClearPill = false } = {}) => {
     inFlightMainReqId = null;
     inFlightMainSignal = null;
     stopActiveWaitTimer?.();
-    setRescuePill("");
+    setRescuePill("", null, { force: forceClearPill });
   };
+
+  if (events?.CHAT_COMPLETION_SETTINGS_READY) {
+    context.eventSource.on(events.CHAT_COMPLETION_SETTINGS_READY, data => {
+      if (!data || typeof data !== "object" || data.chat_completion_source !== "makersuite") return;
+      if (data.type === "quiet" || data.type === "impersonate") return;
+      if (inFlightMainReqId !== null && !inFlightMainSignal?.aborted) return;
+      const eff = typeof data.reasoning_effort === "string" ? data.reasoning_effort.trim() : "";
+      lastSettingsReadyEffort = eff || null;
+      lastSettingsReadyAt = performance.now();
+    });
+  }
 
   if (events?.GENERATION_STARTED) {
     context.eventSource.on(events.GENERATION_STARTED, (type, _opts, dryRun) => {
       if (!dryRun && type !== "quiet" && type !== "impersonate") {
-        resetInFlight();
+        mainGenActive = true;
+        mainGenStartedAt = performance.now();
+        resetInFlight({ forceClearPill: true });
       }
     });
   }
-  const endMainGen = () => {
-    resetInFlight();
-  };
-  if (events?.GENERATION_ENDED) context.eventSource.on(events.GENERATION_ENDED, endMainGen);
-  if (events?.GENERATION_STOPPED) context.eventSource.on(events.GENERATION_STOPPED, endMainGen);
 
-  if (events?.OAI_PRESET_CHANGED_AFTER) {
-    context.eventSource.on(events.OAI_PRESET_CHANGED_AFTER, () => {
-      if (!document.getElementById("pg_streaming_settings")) mountPanel();
-      updatePresetHint();
+  if (events?.GENERATION_ENDED) {
+    context.eventSource.on(events.GENERATION_ENDED, () => {
+      const proc = SillyTavern.getContext()?.streamingProcessor;
+      const mainStillStreaming = Boolean(proc && !proc.isFinished && !proc.abortController?.signal?.aborted);
+      if (mainStillStreaming && inFlightMainReqId !== null && !inFlightMainSignal?.aborted) {
+        // 后台 quiet 任务完成触发的 GENERATION_ENDED，绝不误杀进行中的主请求计时器与占位态
+        return;
+      }
+      mainGenActive = false;
+      resetInFlight({ forceClearPill: false });
     });
+  }
+
+  if (events?.GENERATION_STOPPED) {
+    context.eventSource.on(events.GENERATION_STOPPED, () => {
+      mainGenActive = false;
+      resetInFlight({ forceClearPill: true });
+    });
+  }
+
+  const onPresetChanged = () => {
+    if (!document.getElementById("pg_streaming_settings")) mountPanel();
+    bindHostControlEvents();
+    updatePresetHint();
+  };
+  if (events?.OAI_PRESET_CHANGED_AFTER) {
+    context.eventSource.on(events.OAI_PRESET_CHANGED_AFTER, onPresetChanged);
+  }
+  if (events?.PRESET_CHANGED) {
+    context.eventSource.on(events.PRESET_CHANGED, onPresetChanged);
   }
   if (events?.CHAT_CHANGED) {
     context.eventSource.on(events.CHAT_CHANGED, () => {
       activeMainReqId++;
-      resetInFlight();
+      mainGenActive = false;
+      resetInFlight({ forceClearPill: true });
       setStatus("");
       if (!document.getElementById("pg_streaming_settings")) mountPanel();
+      bindHostControlEvents();
       updatePresetHint();
     });
   }
@@ -708,30 +1054,34 @@ function mountPanel() {
   panel.id = "pg_streaming_settings";
   panel.innerHTML = `
     <div class="pg-header">
-      <span class="pg-title">PG / AI Studio 真流式抗截断</span>
-      <span class="pg-badge" id="pg_mode_badge">真流式已开启</span>
+      <div class="pg-title-group">
+        <span class="pg-title">PG / AI Studio 真流式抗截断</span>
+        <span class="pg-version">v${PLUGIN_VERSION}</span>
+      </div>
+      <span class="pg-badge" id="pg_mode_badge">流式+防截断</span>
     </div>
+    <div class="pg-runtime-summary" id="pg_runtime_summary"></div>
     <label class="pg-control-label" for="pg_streaming_mode">
       <span>传输模式</span>
       <select id="pg_streaming_mode" class="text_pole">
         <option value="off">关闭（走原始 AI Studio / PG）</option>
-        <option value="streaming">流式抗截断（真流式 + 截断自动无感接力，推荐）</option>
-        <option value="native-fc">原生函数抗截断（全程防截断 + 思考提速，不流式）</option>
-        <option value="buffered">非流式抗截断（收完校验后整段交付）</option>
+        <option value="streaming">流式抗截断（真流式 + 自动接力，推荐）</option>
+        <option value="native-fc">原生函数抗截断（整段稳出，不流式）</option>
+        <option value="buffered">非流式抗截断（整段校验后输出）</option>
       </select>
     </label>
     <label class="pg-control-label" for="pg_thinking_effort">
       <span>PG 思考强度</span>
       <select id="pg_thinking_effort" class="text_pole">
-        <option value="preset">跟随预设默认（自动修正超限思考参数）</option>
+        <option value="preset">跟随预设默认（自动桥接并防报错）</option>
         <option value="low">低思考（最快出字，推荐提速）</option>
-        <option value="medium">中思考（均衡）</option>
+        <option value="medium">中思考（速度与质量均衡）</option>
         <option value="high">高思考（深度推理，等待较长）</option>
-        <option value="minimal">极简思考（仅闪速系生效，Gemini 4 自动按低思考）</option>
+        <option value="minimal">极简思考（Gemini 4 自动降为低）</option>
         <option value="model-default">恢复模型默认（清除预设思考限制）</option>
       </select>
     </label>
-    <small>默认走原生结构化真流式秒出字；遇到高尺度安全截断时自动切原生函数通道无感续完，兼顾流式速度与不断文。</small>
+    <small>默认走原生结构化真流式秒出字；遇到高尺度安全截断或仅出思维链时，自动切原生函数通道无感补全。</small>
     <div class="pg-preset-hint" id="pg_preset_hint" hidden></div>
     <details id="pg_advanced_options">
       <summary>预设兼容与截停设置 <span id="pg_options_summary"></span></summary>
@@ -813,6 +1163,7 @@ function mountPanel() {
   const stopCountEl = panel.querySelector("#pg_stop_count");
   statusEl = panel.querySelector("#pg_streaming_status");
   presetHintEl = panel.querySelector("#pg_preset_hint");
+  runtimeSummaryEl = panel.querySelector("#pg_runtime_summary");
   if (lastStatus.text) {
     setStatus(lastStatus.text, lastStatus.tone);
   }
@@ -923,18 +1274,7 @@ function mountPanel() {
     render();
   });
 
-  // 宿主表单控件只绑定在首次挂接（避免重复注册）
-  const hostStream = document.getElementById("stream_toggle");
-  if (hostStream && !hostStream.dataset?.pgHintBound) {
-    if (hostStream.dataset) hostStream.dataset.pgHintBound = "1";
-    hostStream.addEventListener("change", updatePresetHint);
-  }
-  const webSearch = document.getElementById("openai_enable_web_search");
-  if (webSearch && !webSearch.dataset?.pgHintBound) {
-    if (webSearch.dataset) webSearch.dataset.pgHintBound = "1";
-    webSearch.addEventListener("change", updatePresetHint);
-  }
-
+  bindHostControlEvents();
   ensureMeowPreview();
   render();
 }

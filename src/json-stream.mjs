@@ -1,4 +1,5 @@
-import { isObject, soliumbraFieldOrder, classifyMultiFieldRole } from "./schema.mjs";
+import { isObject, soliumbraFieldOrder, classifyMultiFieldRole, RESERVED_AUX_TOOLS } from "./schema.mjs";
+import { dedupeContinuationOverlap } from "./request.mjs";
 
 const SOLIUMBRA_TAGS = new Map([
   ["think_nya", "think_nya"],
@@ -404,16 +405,22 @@ export class StreamingFlatJsonParser {
           }
           if (ch === "}" || ch === "]") {
             this.nestedDepth--;
-            if (this.nestedDepth === 0) this.mode = "commaOrEnd";
+            if (this.nestedDepth === 0) {
+              this.onFieldClose(this.key);
+              this.mode = "commaOrEnd";
+            }
             continue;
           }
           continue;
         }
         if (ch === ",") {
+          this.onFieldClose(this.key);
           this.mode = "keyOrEnd";
         } else if (ch === "}") {
+          this.onFieldClose(this.key);
           this.mode = "done";
         } else if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+          this.onFieldClose(this.key);
           this.mode = "commaOrEnd";
         }
         continue;
@@ -462,8 +469,10 @@ export class StreamingFlatJsonParser {
           this.inNestedString = false;
           this.nestedEscape = false;
         } else if (ch === ",") {
+          this.onFieldClose(this.key);
           this.mode = "keyOrEnd";
         } else if (ch === "}") {
+          this.onFieldClose(this.key);
           this.mode = "done";
         } else {
           this.mode = "skipValue";
@@ -485,6 +494,11 @@ export class StreamingFlatJsonParser {
       this.escape = false;
       this.hex = null;
       this.high = "";
+      this.mode = "done";
+      this.onFieldClose(this.key);
+      return;
+    }
+    if (this.mode === "skipValue") {
       this.mode = "done";
       this.onFieldClose(this.key);
       return;
@@ -586,12 +600,23 @@ function renderPlanTagField(tagName, field, appendThinkComment) {
   return `<${tagName}>\n${value}${field.closed ? `\n</${tagName}>${appendThinkComment ? "<!--</think>-->" : ""}` : ""}`;
 }
 
+const BODY_CONTAINER_TAGS = new Set([
+  "game", "story", "content", "scene", "chapter", "reply", "narrative", "novel", "body", "main", "text", "output",
+]);
+
 function isCustomBlockWrapperTag(value, closed) {
   const m = /^<([a-zA-Z][a-zA-Z0-9_-]*)>/.exec(value);
   if (!m) return false;
   const tagName = m[1].toLowerCase();
   if (INLINE_HTML_TAGS.has(tagName)) return false;
-  if (!closed) return true;
+  if (!closed) {
+    // 若首块已出现闭合且其后还有正文（如 <status>HP:100</status>\n正文），属于局部前缀标签而非全文外框
+    const closeMatch = new RegExp(`</${escapeRegExp(m[1])}\\s*>`, "i").exec(value);
+    if (closeMatch && value.slice(closeMatch.index + closeMatch[0].length).trim().length > 0) {
+      return false;
+    }
+    return BODY_CONTAINER_TAGS.has(tagName);
+  }
   return new RegExp(`</${escapeRegExp(m[1])}\\s*>$`, "i").test(value);
 }
 
@@ -863,23 +888,85 @@ export function formatFunctionCallArgs(fnCall, target) {
   return "";
 }
 
-// 读取接力 functionCall 响应（兼容 SSE 与 JSON，优先解包 functionCall，若模型直接吐纯文本亦自动接住）
-export async function readRescueFunctionResponse(response, target, signal) {
+// 动态扫描已输出文本末尾尚未闭合的外层标签（忽略自闭合 <tag />，覆盖容器标签，用于 raw 风格与二次接力/失败收口）
+export function detectOpenWrapperTag(collectedText, target) {
+  if (!collectedText) return null;
+  const candidates = target?.kind === "soliumbra"
+    ? ["think_nya", ...BODY_CONTAINER_TAGS, "options", "summary", "comment"]
+    : target?.kind === "multi-field"
+      ? [...(target.fieldOrder ?? []), ...BODY_CONTAINER_TAGS]
+      : ["think_nya", ...BODY_CONTAINER_TAGS];
+  const seen = new Set();
+  let latestTag = null;
+  let latestPos = -1;
+  for (const tag of candidates) {
+    if (!tag || seen.has(tag)) continue;
+    seen.add(tag);
+    const esc = escapeRegExp(tag);
+    const openRe = new RegExp(`<${esc}(?:\\s[^>]*)?>`, "gi");
+    const closeRe = new RegExp(`</${esc}\\s*>`, "gi");
+    let lastOpen = -1;
+    let m;
+    while ((m = openRe.exec(collectedText)) !== null) {
+      if (/\/\s*>$/.test(m[0])) continue; // 忽略自闭合 <game /> / <content type="a"/>
+      lastOpen = m.index;
+    }
+    if (lastOpen < 0) continue;
+    let lastClose = -1;
+    while ((m = closeRe.exec(collectedText)) !== null) lastClose = m.index;
+    if (lastOpen > lastClose && lastOpen > latestPos) {
+      latestPos = lastOpen;
+      latestTag = tag;
+    }
+  }
+  return latestTag;
+}
+
+function isAcceptedRescueToolName(name, target) {
+  if (!name) return true;
+  if (RESERVED_AUX_TOOLS.has(name)) return false;
+  if (target?.toolName && name !== target.toolName && name !== "continuation_reply") {
+    return false;
+  }
+  return true;
+}
+
+// 读取接力 functionCall 响应（兼容 SSE 与 JSON，拒绝 context 等辅助工具误解包，回调思考/保活进度并提取上游错误体）
+export async function readRescueFunctionResponse(response, target, signal, onRescueProgress = null) {
   if (!response?.ok) {
-    throw new Error(`接力请求失败（状态码 ${response?.status ?? "未知"}）`);
+    let detail = "";
+    try {
+      const rawErr = (await response.text()).slice(0, 4096).trim();
+      if (rawErr) {
+        try {
+          const parsedErr = JSON.parse(rawErr);
+          detail = parsedErr?.error?.message || parsedErr?.message || rawErr;
+        } catch {
+          detail = rawErr.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        }
+      }
+    } catch {
+      // ignore body read error
+    }
+    const shortDetail = detail ? `：${detail.slice(0, 180)}` : "";
+    const err = new Error(`接力请求失败（状态码 ${response?.status ?? "未知"}）${shortDetail}`);
+    err.httpStatus = response?.status ?? 0;
+    throw err;
   }
   const ct = response.headers.get("content-type") ?? "";
   let textOut = "";
   let fnText = "";
   let finishReason = "STOP";
+  let sawFinishReason = false;
   let usageMetadata = null;
   let errorMessage = "";
   let blockReason = "";
+  let thoughtChars = 0;
 
   const consumeObj = parsed => {
     if (!isObject(parsed)) return;
     if (parsed.error) {
-      errorMessage = parsed.error?.message || String(parsed.error);
+      errorMessage = parsed.error?.message || (typeof parsed.error === "string" ? parsed.error : JSON.stringify(parsed.error));
       return;
     }
     if (!parsed.candidates?.length && parsed.promptFeedback) {
@@ -888,10 +975,14 @@ export async function readRescueFunctionResponse(response, target, signal) {
     }
     if (!Array.isArray(parsed.candidates) && Array.isArray(parsed.choices)) {
       const msg = parsed.choices?.[0]?.message;
-      if (msg?.tool_calls?.[0]?.function) {
-        const fc = msg.tool_calls[0].function;
-        const formatted = formatFunctionCallArgs(fc, target);
-        if (formatted) fnText += formatted;
+      if (Array.isArray(msg?.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          const fc = tc?.function;
+          if (fc && isAcceptedRescueToolName(fc.name, target)) {
+            const formatted = formatFunctionCallArgs(fc, target);
+            if (formatted) fnText += formatted;
+          }
+        }
       } else if (typeof msg?.content === "string" && msg.content) {
         textOut += msg.content;
       }
@@ -901,10 +992,17 @@ export async function readRescueFunctionResponse(response, target, signal) {
     const cand = parsed.candidates?.[0];
     if (cand?.finishReason && cand.finishReason !== "FINISH_REASON_UNSPECIFIED") {
       finishReason = cand.finishReason;
+      sawFinishReason = true;
     }
     for (const part of cand?.content?.parts ?? []) {
       if (!isObject(part)) continue;
+      if (part.thought === true && typeof part.text === "string" && part.text) {
+        thoughtChars += part.text.length;
+        onRescueProgress?.({ phase: "rescue-thinking", thoughtChars });
+        continue;
+      }
       if (part.functionCall) {
+        if (!isAcceptedRescueToolName(part.functionCall.name, target)) continue;
         const formatted = formatFunctionCallArgs(part.functionCall, target);
         if (formatted) fnText += formatted;
       } else if (!part.thought && typeof part.text === "string" && part.text) {
@@ -923,9 +1021,33 @@ export async function readRescueFunctionResponse(response, target, signal) {
     const reader = response.body.getReader();
     const onAbort = () => { reader.cancel().catch(() => {}); };
     if (signal && !signal.aborted) signal.addEventListener("abort", onAbort, { once: true });
-    const parser = createSseParser(({ data }) => {
-      if (!data || data.trim() === "[DONE]") return;
-      try { consumeObj(JSON.parse(data)); } catch {}
+    const parser = createSseParser(({ raw, data, event }) => {
+      if (event === "error") {
+        if (!errorMessage) {
+          try {
+            const errObj = JSON.parse(data);
+            errorMessage = errObj?.error?.message || errObj?.message || data || "接力上游 SSE 错误";
+          } catch {
+            errorMessage = (data || raw || "接力上游 SSE 错误").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 180);
+          }
+        }
+        return;
+      }
+      if (!data) {
+        if (raw && raw.trim().startsWith(":")) {
+          onRescueProgress?.({ phase: "rescue-keepalive", thoughtChars });
+        }
+        return;
+      }
+      if (data.trim() === "[DONE]") return;
+      try {
+        consumeObj(JSON.parse(data));
+      } catch {
+        const plain = data.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        if (plain && !errorMessage) {
+          errorMessage = `接力上游返回非 JSON 响应：${plain.slice(0, 140)}`;
+        }
+      }
     });
     try {
       while (true) {
@@ -949,6 +1071,8 @@ export async function readRescueFunctionResponse(response, target, signal) {
     text: fnText || textOut,
     usedFunctionCall: Boolean(fnText),
     finishReason,
+    sawFinishReason,
+    thoughtChars,
     usageMetadata,
     errorMessage,
     blockReason,
@@ -985,6 +1109,64 @@ function isTauriErrorText(text) {
   return Boolean(label && text.startsWith(`[${label}]`));
 }
 
+function extractHttpStatusCode(message) {
+  const m = /(?:状态码|HTTP)\s*(\d{3})|\b(4\d{2}|5\d{2})\b/.exec(String(message || ""));
+  const code = Number(m?.[1] ?? m?.[2] ?? 0);
+  return code >= 400 && code < 600 ? code : 0;
+}
+
+// 接力结果无损去重与标签闭合拼接（顺序执行：去重复规划块 -> 去重复开标签/补闭标签 -> 续写末尾重叠二次去重）
+function stitchRescuePiece(collectedText, rawPiece, openState, ctx, target) {
+  let piece = rawPiece || "";
+  if (!piece || !collectedText) return piece;
+
+  const openTag = openState?.openWrapperTag || null;
+  let strippedAnyTag = false;
+
+  // 1. 若前文已有已闭合的规划块（且当前并非处于该规划块内部），先剥除续写开头误吐的重复规划块
+  const planTag = target?.kind === "soliumbra"
+    ? "think_nya"
+    : (target?.kind === "multi-field"
+      ? (target.fieldOrder ?? []).find(k => classifyMultiFieldRole(k) === "plan")
+      : null);
+  if (planTag && openTag !== planTag) {
+    const escPlan = escapeRegExp(planTag);
+    const alreadyHasPlan = new RegExp(`<${escPlan}(?:\\s[^>]*)?>[\\s\\S]*?</${escPlan}\\s*>`, "i").test(collectedText);
+    if (alreadyHasPlan) {
+      const dupPlanBlockRe = new RegExp(`^\\s*<${escPlan}(?:\\s[^>]*)?>[\\s\\S]*?</${escPlan}\\s*>(?:<!--</think>-->)?\\s*`, "i");
+      if (dupPlanBlockRe.test(piece)) {
+        piece = piece.replace(dupPlanBlockRe, "");
+        strippedAnyTag = true;
+      }
+    }
+  }
+
+  // 2. 若前文正处于某未闭合外层标签内：剥离重复开标签（正文续写绝不往半句中间插换行），或 full-fallback 缺闭标签时先闭合旧块
+  if (openTag) {
+    const escOpen = escapeRegExp(openTag);
+    const dupOpenRe = new RegExp(`^\\s*<${escOpen}(?:\\s[^>]*)?>\\s*`, "i");
+    const hasCloseRe = new RegExp(`</${escOpen}\\s*>`, "i");
+    if (dupOpenRe.test(piece)) {
+      piece = piece.replace(dupOpenRe, "");
+      strippedAnyTag = true;
+      const isPlanOpen = openTag === "think_nya"
+        || (target?.kind === "multi-field" && classifyMultiFieldRole(openTag) === "plan");
+      if ((ctx.mode === "full-fallback" || isPlanOpen) && piece && !collectedText.endsWith("\n") && !piece.startsWith("\n")) {
+        piece = `\n${piece}`;
+      }
+    } else if (ctx.mode === "full-fallback" && !hasCloseRe.test(piece)) {
+      const closeSuffix = openTag === "think_nya" ? "<!--</think>-->" : "";
+      piece = `\n</${openTag}>${closeSuffix}\n${piece.trimStart()}`;
+    }
+  }
+
+  // 3. 若剥离过重复规划块或开标签，在 continue 模式下再补一次末尾句子重叠去重
+  if (strippedAnyTag && ctx.mode === "continue" && piece) {
+    piece = dedupeContinuationOverlap(collectedText, piece, openTag);
+  }
+  return piece;
+}
+
 // 把 TauriTavern 的原生 Gemini SSE 流实时还原为标准正文 SSE（或非流式 JSON）；
 // 当遇到 PROHIBITED_CONTENT / SAFETY 等上游安全截断且提供 onRescue 时，自动在同条流内切到原生 functionCall 无感续完剩余正文！
 export async function restorePgResponse(response, prepared, signal, onProgress = () => {}, onRescue = null) {
@@ -996,6 +1178,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
   const stop = stopRule ? createTagStop(stopRule.tag, stopRule.count, stopRule.exemptTag) : null;
   const restorer = new PgJsonRestorer(prepared.target, stop);
   const canRescue = typeof onRescue === "function" && prepared.autoRescue !== false;
+  const hasOriginalTools = Array.isArray(prepared.originalWorkingBody?.tools) && prepared.originalWorkingBody.tools.length > 0;
   const MAX_RESCUES = 2;
 
   const startedAt = performance.now();
@@ -1015,6 +1198,8 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
   let pendingRescue = null;
   let rescuedCount = 0;
   let finishFrameEmitted = false;
+  let sawUpstreamDone = false;
+  let stoppedByTag = false;
 
   const reportDone = (extra = {}) => {
     if (doneReported) return;
@@ -1064,12 +1249,35 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
     }
   };
 
+  const emitChunkedText = (emit, text) => {
+    for (let off = 0; off < text.length; ) {
+      let end = Math.min(off + 160, text.length);
+      if (end < text.length) {
+        const lastCode = text.charCodeAt(end - 1);
+        if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+          end = end > off + 1 ? end - 1 : Math.min(end + 1, text.length);
+        }
+      }
+      chunksEmitted++;
+      emit(sseData({
+        candidates: [{ index: 0, content: { role: "model", parts: [{ text: text.slice(off, end) }] } }],
+      }));
+      off = end;
+    }
+  };
+
   const runRescueLoop = async (emit, shouldStreamChunks) => {
     while (pendingRescue && rescuedCount < MAX_RESCUES) {
       const ctx = pendingRescue;
       pendingRescue = null;
       const attempt = rescuedCount + 1;
-      const openState = restorer.getOpenState();
+      const rawOpen = attempt === 1
+        ? restorer.getOpenState()
+        : { openFieldKey: "", openWrapperTag: null };
+      const openState = {
+        openFieldKey: rawOpen.openFieldKey,
+        openWrapperTag: rawOpen.openWrapperTag || detectOpenWrapperTag(collectedText, prepared.target),
+      };
       onProgress({
         phase: "rescuing",
         attempt,
@@ -1091,22 +1299,48 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
           signal,
         });
       } catch (err) {
-        if (signal?.aborted || err?.name === "AbortError") throw err;
-        rescued = { text: "", errorMessage: err?.message || "接力请求失败" };
+        if (signal?.aborted) throw err;
+        rescued = {
+          text: "",
+          errorMessage: err?.message || "接力请求失败",
+          timedOut: Boolean(err?.isRescueTimeout),
+        };
       }
 
-      if (!rescued || (!rescued.text && (rescued.errorMessage || rescued.blockReason))) {
-        // 接力失败：退回常规收尾并保留已生成的全部前文
+      const rawRescueText = typeof rescued?.text === "string" ? rescued.text : "";
+      let piece = rawRescueText.trim()
+        ? stitchRescuePiece(collectedText, rawRescueText, openState, ctx, prepared.target)
+        : "";
+      if (!rescued || !piece.trim()) {
+        // 接力失败、静默 0 字或纯重复空接力：退回常规收尾、闭合已开标签并保留已生成的全部前文，绝不伪造 STOP
         if (rescued?.errorMessage) errorMessage = rescued.errorMessage;
         else if (rescued?.blockReason) blockReason = rescued.blockReason;
-        const tail = restorer.finish();
-        if (tail) {
-          markFirstText();
-          collectedText += tail;
-          chunksEmitted++;
-          emit(sseData({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: tail }] } }] }));
+        else errorMessage = "接力通道未返回有效正文（已保留前文），可点「继续」续写";
+
+        if (!ctx.discardedPartial) {
+          if (attempt === 1) {
+            const closeTail = restorer.finish();
+            if (closeTail) {
+              markFirstText();
+              collectedText += closeTail;
+              if (shouldStreamChunks) {
+                chunksEmitted++;
+                emit(sseData({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: closeTail }] } }] }));
+              }
+            }
+          }
+          const stillOpen = detectOpenWrapperTag(collectedText, prepared.target);
+          if (stillOpen) {
+            const extraClose = `\n</${stillOpen}>${stillOpen === "think_nya" ? "<!--</think>-->" : ""}`;
+            collectedText += extraClose;
+            if (shouldStreamChunks) {
+              chunksEmitted++;
+              emit(sseData({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: extraClose }] } }] }));
+            }
+          }
         }
         finalFinishReason = ctx.reason;
+        finishFrameEmitted = true;
         emit(sseData({
           candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: finalFinishReason }],
           ...(usageMetadata ? { usageMetadata } : {}),
@@ -1119,7 +1353,6 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
         usageMetadata = mergeUsageMetadata(usageMetadata, rescued.usageMetadata);
       }
 
-      let piece = rescued.text || "";
       if (stop && piece) piece = stop.clip(piece);
       if (ctx.reason === "MISSING_BODY_STOP" && piece && collectedText && !collectedText.endsWith("\n") && !piece.startsWith("\n")) {
         piece = `\n${piece}`;
@@ -1128,20 +1361,38 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
         markFirstText();
         collectedText += piece;
         if (shouldStreamChunks) {
-          // 按 160 字平滑吐出接力续文，既不卡顿 DOM 又能直观看到无缝续接完成
-          for (let off = 0; off < piece.length; off += 160) {
-            chunksEmitted++;
-            emit(sseData({
-              candidates: [{ index: 0, content: { role: "model", parts: [{ text: piece.slice(off, off + 160) }] } }],
-            }));
-          }
+          emitChunkedText(emit, piece);
         } else {
           chunksEmitted++;
         }
       }
 
+      // 接力中途已吐出部分文字但随后报错/拦截：保留已吐续文、上报错误、闭合残余标签且不谎报正常 STOP
+      if (rescued.errorMessage || rescued.blockReason) {
+        if (rescued.errorMessage) errorMessage = rescued.errorMessage;
+        else blockReason = rescued.blockReason;
+        const stillOpen = detectOpenWrapperTag(collectedText, prepared.target);
+        if (stillOpen) {
+          const extraClose = `\n</${stillOpen}>${stillOpen === "think_nya" ? "<!--</think>-->" : ""}`;
+          collectedText += extraClose;
+          if (shouldStreamChunks) {
+            chunksEmitted++;
+            emit(sseData({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: extraClose }] } }] }));
+          }
+        }
+        finalFinishReason = ctx.reason;
+        finishFrameEmitted = true;
+        emit(sseData({
+          candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: finalFinishReason }],
+          ...(usageMetadata ? { usageMetadata } : {}),
+        }));
+        return;
+      }
+
       if (stop?.marker()) {
+        stoppedByTag = true;
         finalFinishReason = "STOP";
+        finishFrameEmitted = true;
         emit(sseData({
           candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }],
           ...(usageMetadata ? { usageMetadata } : {}),
@@ -1158,6 +1409,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
       finalFinishReason = nextReason;
       blockReason = "";
       promptFeedbackObj = null;
+      finishFrameEmitted = true;
       emit(sseData({
         candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: finalFinishReason }],
         ...(usageMetadata ? { usageMetadata } : {}),
@@ -1175,7 +1427,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
           errorMessage = errObj?.error?.message || errObj?.message || data || "上游 SSE 错误事件";
           if (!upstreamErrorObj && isObject(errObj)) upstreamErrorObj = errObj;
         } catch {
-          errorMessage = data || "上游 SSE 错误事件";
+          errorMessage = (data || "上游 SSE 错误事件").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 180);
         }
       }
       emit(rawErrorFrame);
@@ -1183,22 +1435,23 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
     }
     if (!data) return;
     if (data.trim() === "[DONE]") {
-      if (pendingRescue) return false;
-      const tail = restorer.finish();
-      if (tail) {
-        markFirstText();
-        collectedText += tail;
-        chunksEmitted++;
-        emit(sseData({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: tail }] } }] }));
-      }
-      emit(sseData("[DONE]"));
-      return;
+      // 严禁在 handleEvent 内提前发出 [DONE]，统一交由流末/接力闭环按严格顺序单次收口！
+      sawUpstreamDone = true;
+      return false;
     }
 
     let parsed;
     try {
       parsed = JSON.parse(data);
     } catch {
+      const trimmed = data.trim();
+      if (trimmed && !errorMessage) {
+        const looksLikeError = /(?:<html|<!doctype|bad gateway|service unavailable|gateway timeout|error|50[0234]|429|40[0134])/i.test(trimmed);
+        if (looksLikeError || (!collectedText && chunksEmitted === 0)) {
+          errorMessage = `上游返回非 JSON 响应：${trimmed.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 140)}`;
+          rawErrorFrame = raw + "\n\n";
+        }
+      }
       return;
     }
 
@@ -1236,9 +1489,11 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
 
     for (const part of parts) {
       if (!isObject(part)) continue;
+      const sig = part.thoughtSignature ?? part.thought_signature;
+      const sigObj = sig ? { thoughtSignature: sig } : null;
       if (part.thought === true && typeof part.text === "string" && part.text) {
         collectedReasoning += part.text;
-        outParts.push({ thought: true, text: part.text });
+        outParts.push({ thought: true, text: part.text, ...(sigObj || {}) });
         if (firstTextMs === null) maybeEmitProgress("thinking");
         continue;
       }
@@ -1246,7 +1501,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
         if (isTauriErrorText(part.text)) {
           errorMessage = part.text.split(/\r?\n/).slice(0, 2).join(" ").trim();
           collectedText += part.text;
-          outParts.push({ text: part.text });
+          outParts.push({ text: part.text, ...(sigObj || {}) });
           continue;
         }
         const restoredText = restorer.feed(part.text);
@@ -1254,10 +1509,16 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
           markFirstText();
           collectedText += restoredText;
           chunksEmitted++;
-          outParts.push({ text: restoredText });
+          outParts.push({ text: restoredText, ...(sigObj || {}) });
           maybeEmitProgress("streaming");
+        } else if (sigObj) {
+          outParts.push(sigObj);
         }
         if (stop?.marker()) break;
+        continue;
+      }
+      if (sigObj) {
+        outParts.push(sigObj);
       }
     }
 
@@ -1266,13 +1527,29 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
       // 命中安全/策略截断（PROHIBITED_CONTENT / SAFETY 等）且开启无感接力：
       // 先发出本帧已解出的文字，绝不提前调 restorer.finish() 误闭合标签，也不发 [DONE]，交由 runRescueLoop 无感续写！
       if (canRescue && rescuedCount < MAX_RESCUES && RESCUE_TRIGGER_REASONS.has(reason)) {
+        if (!prepared.upstreamStream) {
+          // 非流式整段校验模式：极短截断 (<150 字) 或正文未出时直接清空走纯净 full-fallback
+          const useFull = collectedText.trim().length === 0
+            || (hasOriginalTools && (collectedText.trim().length < 150 || restorer.isMissingBody()));
+          if (useFull) {
+            collectedText = "";
+            chunksEmitted = 0;
+            firstTextMs = null;
+            pendingRescue = { mode: "full-fallback", reason, discardedPartial: true };
+            return false;
+          }
+          pendingRescue = { mode: "continue", reason };
+          return false;
+        }
         if (outParts.length > 0) {
           emit(sseData({
             candidates: [{ index: candidate?.index ?? 0, content: { role: "model", parts: outParts } }],
           }));
         }
+        const useFull = collectedText.trim().length === 0
+          || (hasOriginalTools && collectedText.trim().length < 150 && restorer.isMissingBody());
         pendingRescue = {
-          mode: collectedText.trim().length > 0 ? "continue" : "full-fallback",
+          mode: useFull ? "full-fallback" : "continue",
           reason,
         };
         return false;
@@ -1287,27 +1564,38 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
         outParts.push({ text: tail });
       }
 
-      // Gemini 4 高尺度静默假 STOP（只吐思维链/思考块、正文完全 0 字却报 finishReason=STOP）：
-      // 自动切原生 functionCall 接力补全正文，彻底解决“出完思维链就没了”！
-      if (canRescue && rescuedCount < MAX_RESCUES && reason === "STOP" && !errorMessage && !blockReason) {
+      // Gemini 4 静默假 STOP 或思考耗尽 MAX_TOKENS（正文 0 字）自动接力补全，在发出 finishReason 之前决策！
+      if (canRescue && rescuedCount < MAX_RESCUES && !errorMessage && !blockReason) {
         const missingAll = collectedText.trim().length === 0;
-        const missingBody = !missingAll && restorer.isMissingBody();
-        if (missingAll || missingBody) {
+        if (reason === "STOP") {
+          const missingBody = !missingAll && restorer.isMissingBody();
+          if (missingAll || missingBody) {
+            if (outParts.length > 0) {
+              emit(sseData({
+                candidates: [{ index: candidate?.index ?? 0, content: { role: "model", parts: outParts } }],
+              }));
+            }
+            pendingRescue = missingAll
+              ? { mode: "full-fallback", reason: "EMPTY_STOP" }
+              : { mode: "continue", reason: "MISSING_BODY_STOP" };
+            return false;
+          }
+        } else if (reason === "MAX_TOKENS" && missingAll) {
           if (outParts.length > 0) {
             emit(sseData({
               candidates: [{ index: candidate?.index ?? 0, content: { role: "model", parts: outParts } }],
             }));
           }
-          pendingRescue = missingAll
-            ? { mode: "full-fallback", reason: "EMPTY_STOP" }
-            : { mode: "continue", reason: "MISSING_BODY_STOP" };
+          pendingRescue = { mode: "full-fallback", reason: "EMPTY_STOP" };
           return false;
         }
       }
     }
 
     if (stop?.marker()) {
+      stoppedByTag = true;
       finalFinishReason = "STOP";
+      finishFrameEmitted = true;
       const outFrame = {
         candidates: [{ index: 0, content: { role: "model", parts: outParts }, finishReason: "STOP" }],
         ...(usageMetadata ? { usageMetadata } : {}),
@@ -1360,6 +1648,47 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
       closeStreamSafely();
     };
 
+    const finalizeStream = async emit => {
+      if (!pendingRescue && !stoppedByTag && !closed) {
+        const tail = restorer.finish();
+        if (tail) {
+          markFirstText();
+          collectedText += tail;
+          chunksEmitted++;
+          emit(sseData({
+            candidates: [{ index: 0, content: { role: "model", parts: [{ text: tail }] } }],
+          }));
+        }
+        if (!finishFrameEmitted && canRescue && rescuedCount < MAX_RESCUES && !errorMessage && !blockReason && !stop?.marker()) {
+          if (collectedText.trim().length === 0) {
+            pendingRescue = { mode: "full-fallback", reason: "EMPTY_STOP" };
+          } else if (restorer.isMissingBody()) {
+            pendingRescue = { mode: "continue", reason: "MISSING_BODY_STOP" };
+          }
+        }
+      }
+      if (pendingRescue && !closed) {
+        await runRescueLoop(emit, true);
+        if (!doneEmitted && !closed) emit(sseData("[DONE]"));
+        reportDone(stop?.marker() ? { stoppedByTag: stop.marker() } : {});
+      } else if (!stoppedByTag && !closed) {
+        const hasHardError = Boolean(upstreamErrorObj || promptFeedbackObj || errorMessage || blockReason);
+        if (!collectedText && !upstreamErrorObj && !promptFeedbackObj && errorMessage) {
+          const inferredCode = extractHttpStatusCode(errorMessage) || 502;
+          emit(sseData({ error: { code: inferredCode, message: errorMessage } }));
+        }
+        if (!finishFrameEmitted && !(hasHardError && !collectedText)) {
+          finishFrameEmitted = true;
+          emit(sseData({
+            candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: finalFinishReason }],
+            ...(usageMetadata ? { usageMetadata } : {}),
+          }));
+        }
+        if (!doneEmitted) emit(sseData("[DONE]"));
+        reportDone();
+      }
+    };
+
     const streamBody = new ReadableStream({
       start(controller) {
         streamController = controller;
@@ -1398,39 +1727,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
             }
             if (done) {
               sseParser.finish();
-              if (!pendingRescue && !stopped && !closed) {
-                const tail = restorer.finish();
-                if (tail) {
-                  markFirstText();
-                  collectedText += tail;
-                  chunksEmitted++;
-                  emit(sseData({
-                    candidates: [{ index: 0, content: { role: "model", parts: [{ text: tail }] } }],
-                  }));
-                }
-                if (canRescue && rescuedCount < MAX_RESCUES && !errorMessage && !blockReason && !stop?.marker()) {
-                  if (collectedText.trim().length === 0) {
-                    pendingRescue = { mode: "full-fallback", reason: "EMPTY_STOP" };
-                  } else if (restorer.isMissingBody()) {
-                    pendingRescue = { mode: "continue", reason: "MISSING_BODY_STOP" };
-                  }
-                }
-              }
-              if (pendingRescue && !closed) {
-                await runRescueLoop(emit, true);
-                if (!doneEmitted && !closed) emit(sseData("[DONE]"));
-                reportDone(stop?.marker() ? { stoppedByTag: stop.marker() } : {});
-              } else if (!stopped && !closed) {
-                if (!finishFrameEmitted) {
-                  finishFrameEmitted = true;
-                  emit(sseData({
-                    candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: finalFinishReason }],
-                    ...(usageMetadata ? { usageMetadata } : {}),
-                  }));
-                }
-                if (!doneEmitted) emit(sseData("[DONE]"));
-                reportDone();
-              }
+              await finalizeStream(emit);
               cleanupSignal();
               closeStreamSafely();
               return;
@@ -1441,6 +1738,13 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
               await runRescueLoop(emit, true);
               if (!doneEmitted && !closed) emit(sseData("[DONE]"));
               reportDone(stop?.marker() ? { stoppedByTag: stop.marker() } : {});
+              cleanupSignal();
+              closeStreamSafely();
+              return;
+            }
+            if (sawUpstreamDone && !closed) {
+              await reader.cancel().catch(() => {});
+              await finalizeStream(emit);
               cleanupSignal();
               closeStreamSafely();
               return;
@@ -1508,19 +1812,19 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
       }
       if (done) break;
       parser.push(value);
-      if (stop?.marker() || pendingRescue) {
+      if (stop?.marker() || pendingRescue || sawUpstreamDone) {
         await reader.cancel().catch(() => {});
         break;
       }
     }
     parser.finish();
-    if (!pendingRescue) {
+    if (!pendingRescue && !stoppedByTag) {
       const tail = restorer.finish();
       if (tail) {
         markFirstText();
         collectedText += tail;
       }
-      if (canRescue && rescuedCount < MAX_RESCUES && !errorMessage && !blockReason && !stop?.marker()) {
+      if (!finishFrameEmitted && canRescue && rescuedCount < MAX_RESCUES && !errorMessage && !blockReason && !stop?.marker()) {
         if (collectedText.trim().length === 0) {
           pendingRescue = { mode: "full-fallback", reason: "EMPTY_STOP" };
         } else if (restorer.isMissingBody()) {
@@ -1546,20 +1850,20 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
 
   reportDone(stop?.marker() ? { stoppedByTag: stop.marker() } : {});
 
-  if (!collectedText && (upstreamErrorObj || promptFeedbackObj || rawErrorFrame)) {
+  if (!collectedText && (upstreamErrorObj || promptFeedbackObj || rawErrorFrame || errorMessage || blockReason)) {
+    const inferredCode = Number(upstreamErrorObj?.error?.code) || extractHttpStatusCode(errorMessage) || 502;
+    const synthPayload = upstreamErrorObj
+      ?? promptFeedbackObj
+      ?? { error: { code: inferredCode, message: errorMessage || `请求被上游拦截（${blockReason}）` } };
     if (prepared.stream) {
-      const errBody = rawErrorFrame
-        || sseData(upstreamErrorObj ?? promptFeedbackObj) + sseData("[DONE]");
+      const errBody = rawErrorFrame || (sseData(synthPayload) + sseData("[DONE]"));
       return new Response(errBody, {
         status: 200,
         headers: { "content-type": "text/event-stream; charset=utf-8", "x-pg-streaming-transport": "buffered" },
       });
     }
-    const errPayload = upstreamErrorObj
-      ?? promptFeedbackObj
-      ?? { error: { code: 502, message: errorMessage || "PG 上游返回错误" } };
-    const statusCode = Number(errPayload?.error?.code);
-    return new Response(JSON.stringify(errPayload), {
+    const statusCode = Number(synthPayload?.error?.code) || inferredCode;
+    return new Response(JSON.stringify(synthPayload), {
       status: statusCode >= 400 && statusCode < 600 ? statusCode : 502,
       headers: { "content-type": "application/json; charset=utf-8", "x-pg-streaming-transport": "buffered" },
     });

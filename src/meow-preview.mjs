@@ -63,6 +63,7 @@ export function installPgMeowPreview(getContext, isActive) {
       || active.processor.isFinished
       || active.processor.abortController?.signal?.aborted
     ) {
+      active?.cancel?.();
       active = undefined;
     }
   };
@@ -73,7 +74,7 @@ export function installPgMeowPreview(getContext, isActive) {
 }
 
 function watch(processor, getContext) {
-  const state = { processor, bodyLimit: null, received };
+  const state = { processor, bodyLimit: null, received, cancel: () => {} };
   const progress = processor.onProgressStreaming.bind(processor);
   const signal = processor.abortController?.signal;
   const fps = Math.max(1, Number(getContext().powerUserSettings?.streaming_fps) || 60);
@@ -96,6 +97,7 @@ function watch(processor, getContext) {
     clearTimeout(timer);
     timer = undefined;
   };
+  state.cancel = cancel;
   signal?.addEventListener("abort", cancel, { once: true });
 
   processor.onProgressStreaming = async (...args) => {

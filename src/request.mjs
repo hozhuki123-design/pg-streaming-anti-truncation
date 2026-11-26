@@ -57,7 +57,10 @@ const REASONING_KEYS = new Set(["reasoning_effort", "reasoningEffort"]);
 
 const GEMINI_4_RE = /^(?:models\/)?gemini-4/i;
 const GEMINI_25_OR_3_RE = /^(?:models\/)?gemini-(?:2\.5|3)/i;
+const GEMINI_32K_CAP_RE = /^(?:models\/)?gemini-4-(?:carbon|argon)/i;
 const GEMINI_65K_CAP_RE = /^(?:models\/)?gemini-(?:2\.5|3|4)/i;
+const GEMINI_NO_MINIMAL_RE = /^(?:models\/)?(?:gemini-4|gemini-3\.8-flash|gemini-3\.1-pro)/i;
+const PLACEHOLDER_REASONING_VALS = new Set(["", "none", "off", "auto", "default", "disabled", "disable"]);
 
 function escapeRegExp(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -353,9 +356,9 @@ export function transformCustomIncludeBody(raw, options = {}) {
   };
 }
 
-// 从 custom_exclude_body 中移除 generationConfig（兼容 JSON/单引号/裸流式数组、YAML 列表与 YAML Map 四种写法）
-export function stripGenerationConfigFromExclude(raw) {
-  const DROP = new Set(["generationConfig", "generation_config"]);
+// 从 custom_exclude_body 中移除指定冲突键（默认 generationConfig，接力模式亦清理 tools/toolConfig）
+export function stripGenerationConfigFromExclude(raw, extraDropKeys = []) {
+  const DROP = new Set(["generationConfig", "generation_config", ...extraDropKeys]);
   if (Array.isArray(raw)) {
     const next = raw.filter(item => !DROP.has(String(item).trim()));
     return { value: next, changed: next.length !== raw.length };
@@ -394,21 +397,32 @@ export function stripGenerationConfigFromExclude(raw) {
   return { value: raw, changed: false };
 }
 
-function customIncludeHasReasoningKey(raw) {
+function readCustomIncludeReasoningInfo(raw) {
   const state = parseCustomInclude(raw);
+  const found = [];
   if (state.format === "json" || state.format === "object") {
-    return Object.keys(state.obj).some(k => REASONING_KEYS.has(k));
+    for (const [k, v] of Object.entries(state.obj)) {
+      if (REASONING_KEYS.has(k)) {
+        found.push({ key: k, value: typeof v === "string" ? v.trim() : String(v ?? "").trim() });
+      }
+    }
+  } else if (state.format === "yaml" || state.format === "yaml-list") {
+    for (const b of state.blocks) {
+      if (b.key && REASONING_KEYS.has(b.key)) {
+        found.push({ key: b.key, value: String(b.scalar ?? "").trim() });
+      }
+    }
   }
-  if (state.format === "yaml" || state.format === "yaml-list") {
-    return state.blocks.some(b => b.key && REASONING_KEYS.has(b.key));
-  }
-  return false;
+  const hasAny = found.length > 0;
+  const effective = found.find(item => !PLACEHOLDER_REASONING_VALS.has(item.value.toLowerCase())) || null;
+  const hasPlaceholderOnly = hasAny && !effective;
+  return { hasAny, effective, hasPlaceholderOnly };
 }
 
 function mapHostReasoningToGemini4(raw) {
   if (typeof raw !== "string") return null;
   const low = raw.trim().toLowerCase();
-  if (!low || low === "auto" || low === "none" || low === "off" || low === "default") return null;
+  if (PLACEHOLDER_REASONING_VALS.has(low)) return null;
   if (low === "min" || low === "minimal") return { effort: "low", downgradedFrom: "minimal" };
   if (low === "low") return { effort: "low", downgradedFrom: null };
   if (low === "medium" || low === "med") return { effort: "medium", downgradedFrom: null };
@@ -418,8 +432,24 @@ function mapHostReasoningToGemini4(raw) {
   return null;
 }
 
-// 公共前置预处理：安全应用 PG 思考档位 + 自动桥接被预设脚本(如 Meowssiah)删掉的酒馆原生思考档位 + 修正 max 400 + 65536 上限保护
-// 对 quiet/impersonate/并发后台请求仅执行防 400 修正（max->high 与 65535 上限），不覆盖用户思考档位。
+export function estimateRequestContextBytes(body) {
+  if (!body || typeof body !== "object") return 0;
+  let total = 0;
+  const enc = new TextEncoder();
+  for (const key of ["messages", "tools", "systemInstruction", "system_instruction"]) {
+    if (body[key] != null) {
+      try {
+        total += enc.encode(JSON.stringify(body[key])).length;
+      } catch {
+        // ignore unserializable fragments
+      }
+    }
+  }
+  return total;
+}
+
+// 公共前置预处理：安全应用 PG 思考档位 + 自动桥接被预设脚本(如 Meowssiah)删掉的酒馆原生思考档位 + 清理占位 reasoning_effort: none + 真实模型上限保护
+// 对 quiet/impersonate/并发后台请求仅执行防 400 修正（max->high 与上限保护），不覆盖用户思考档位。
 export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = false, hostReasoningEffort = null } = {}) {
   if (!body || body.chat_completion_source !== "makersuite") {
     return { body, modified: false, thinkingApplied: null, thinkingDowngradedFrom: null, thinkingFromPreset: false, fixedMaxReasoning: false };
@@ -460,10 +490,10 @@ export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = 
     }
     if (clearedAny) thinkingApplied = "model-default";
   } else if (effort !== "preset") {
+    const noMinimal = GEMINI_NO_MINIMAL_RE.test(model);
+    const effectiveEffort = effort === "minimal" && noMinimal ? "low" : effort;
+    if (effort === "minimal" && noMinimal) thinkingDowngradedFrom = "minimal";
     if (GEMINI_4_RE.test(model)) {
-      // 活体实测：gemini-4-carbon 拒绝 minimal 报 HTTP 400，Gemini 4 自动平滑降档为 low！
-      const effectiveEffort = effort === "minimal" ? "low" : effort;
-      if (effort === "minimal") thinkingDowngradedFrom = "minimal";
       const res = transformCustomIncludeBody(nextBody.custom_include_body, {
         setReasoningKey: "reasoningEffort",
         setReasoningValue: effectiveEffort,
@@ -483,11 +513,11 @@ export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = 
         nextBody.custom_include_body = res.value;
         modified = true;
       }
-      if (nextBody.reasoning_effort !== effort) {
-        nextBody.reasoning_effort = effort;
+      if (nextBody.reasoning_effort !== effectiveEffort) {
+        nextBody.reasoning_effort = effectiveEffort;
         modified = true;
       }
-      thinkingApplied = effort;
+      thinkingApplied = effectiveEffort;
     }
   } else {
     if (nextBody.custom_include_body !== undefined) {
@@ -499,35 +529,74 @@ export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = 
         fixedMaxReasoning = true;
       }
     }
-    // 针对 Gemini 4：若用户选“跟随预设默认”，且 custom_include_body 未显式指定思考强度，
-    // 自动把酒馆预设里的 reasoning_effort（如 Meowssiah 的 low，原本会被其脚本删掉且被 TT 忽略）桥接为 reasoningEffort！
-    if (!isSilentType && GEMINI_4_RE.test(model) && !customIncludeHasReasoningKey(nextBody.custom_include_body)) {
-      const bridged = mapHostReasoningToGemini4(nextBody.reasoning_effort ?? hostReasoningEffort);
-      if (bridged) {
-        const res = transformCustomIncludeBody(nextBody.custom_include_body, {
-          setReasoningKey: "reasoningEffort",
-          setReasoningValue: bridged.effort,
-        });
-        if (res.changed) {
-          nextBody.custom_include_body = res.value;
-          modified = true;
+    // 针对 Gemini 4：若用户选“跟随预设默认”：
+    // (a) 若 custom_include_body 含有效 snake_case/camelCase 思考档位（非 none/off/auto 占位值），统一规范为 reasoningEffort 生效；
+    // (b) 若 custom_include_body 无思考键或仅有占位值（如 37 个预设残留的 reasoning_effort: none），
+    //     自动把酒馆真实 reasoning_effort（优先 body.reasoning_effort，无效则回退 hostReasoningEffort）桥接为 reasoningEffort！
+    if (!isSilentType && GEMINI_4_RE.test(model)) {
+      const incInfo = readCustomIncludeReasoningInfo(nextBody.custom_include_body);
+      if (incInfo.effective) {
+        const mappedInc = mapHostReasoningToGemini4(incInfo.effective.value);
+        if (mappedInc) {
+          if (incInfo.effective.key !== "reasoningEffort" || mappedInc.effort !== incInfo.effective.value.toLowerCase()) {
+            const res = transformCustomIncludeBody(nextBody.custom_include_body, {
+              setReasoningKey: "reasoningEffort",
+              setReasoningValue: mappedInc.effort,
+            });
+            if (res.changed) {
+              nextBody.custom_include_body = res.value;
+              modified = true;
+            }
+          }
+          if (nextBody.reasoning_effort !== undefined) {
+            delete nextBody.reasoning_effort;
+            modified = true;
+          }
+          thinkingApplied = mappedInc.effort;
+          thinkingDowngradedFrom = mappedInc.downgradedFrom;
+          thinkingFromPreset = true;
         }
-        if (nextBody.reasoning_effort !== undefined) {
-          delete nextBody.reasoning_effort;
-          modified = true;
+      } else {
+        const bridged = mapHostReasoningToGemini4(nextBody.reasoning_effort)
+          ?? mapHostReasoningToGemini4(hostReasoningEffort);
+        if (bridged) {
+          const res = transformCustomIncludeBody(nextBody.custom_include_body, {
+            setReasoningKey: "reasoningEffort",
+            setReasoningValue: bridged.effort,
+          });
+          if (res.changed) {
+            nextBody.custom_include_body = res.value;
+            modified = true;
+          }
+          if (nextBody.reasoning_effort !== undefined) {
+            delete nextBody.reasoning_effort;
+            modified = true;
+          }
+          thinkingApplied = bridged.effort;
+          thinkingDowngradedFrom = bridged.downgradedFrom;
+          thinkingFromPreset = true;
+        } else if (incInfo.hasPlaceholderOnly) {
+          // 清理无意义的 reasoning_effort: none 占位残留，避免误传蛇形非法字段
+          const res = transformCustomIncludeBody(nextBody.custom_include_body, { clearReasoning: true });
+          if (res.changed) {
+            nextBody.custom_include_body = res.value;
+            modified = true;
+          }
         }
-        thinkingApplied = bridged.effort;
-        thinkingDowngradedFrom = bridged.downgradedFrom;
-        thinkingFromPreset = true;
       }
     }
   }
 
-  // 2. Gemini 2.5 / 3 / 4 单次输出上限保护（覆盖图灵 4A 500000 等超大预设值）
+  // 2. Gemini 模型真实单次输出上限保护（ListModels 实证：4-carbon/4-argon 为 32768，4-neon/2.5/3 为 65536）
   const maxTok = Number(nextBody.max_tokens);
-  if (GEMINI_65K_CAP_RE.test(model) && Number.isFinite(maxTok) && maxTok > 65536) {
-    nextBody.max_tokens = 65535;
-    modified = true;
+  if (Number.isFinite(maxTok)) {
+    if (GEMINI_32K_CAP_RE.test(model) && maxTok > 32768) {
+      nextBody.max_tokens = 32768;
+      modified = true;
+    } else if (GEMINI_65K_CAP_RE.test(model) && maxTok > 65536) {
+      nextBody.max_tokens = 65535;
+      modified = true;
+    }
   }
 
   return { body: nextBody, modified, thinkingApplied, thinkingDowngradedFrom, thinkingFromPreset, fixedMaxReasoning };
@@ -906,30 +975,128 @@ export function preparePgRequest(body, settings, tagStop = null, runtimeOptions 
     tagStop,
     thinkingApplied: pre.thinkingApplied,
     thinkingDowngradedFrom: pre.thinkingDowngradedFrom,
+    thinkingFromPreset: pre.thinkingFromPreset,
     fixedMaxReasoning: pre.fixedMaxReasoning,
   };
 }
 
-// 去除接力续写开头偶发重复前文末尾的 2~60 字重叠，保证拼接无缝
-export function dedupeContinuationOverlap(existingText, rescueText) {
-  if (!existingText || !rescueText) return rescueText || "";
-  const maxCheck = Math.min(60, existingText.length, rescueText.length);
-  for (let len = maxCheck; len >= 2; len--) {
-    if (existingText.endsWith(rescueText.slice(0, len))) {
-      return rescueText.slice(len);
+// 去除接力续写开头偶发重复的开标签（如 <game> / <think_nya>）与前文末尾 2~400 字重叠，保证拼接无缝
+export function dedupeContinuationOverlap(existingText, rescueText, openWrapperTag = null) {
+  if (!rescueText) return "";
+  let text = rescueText;
+
+  // 1. 若前文正处于某未闭合外壳标签内，剥离续写开头重复输出的开标签（如 <game>\n）
+  if (openWrapperTag) {
+    const openRe = new RegExp(`^\\s*<${escapeRegExp(openWrapperTag)}(?:\\s[^>]*)?>\\s*`, "i");
+    if (openRe.test(text)) {
+      text = text.replace(openRe, "");
     }
   }
-  // 容忍续写开头多出一个换行后再重复末尾短语
-  if (rescueText.startsWith("\n")) {
-    const trimmed = rescueText.replace(/^\n+/, "");
-    const max2 = Math.min(60, existingText.length, trimmed.length);
-    for (let len = max2; len >= 3; len--) {
-      if (existingText.endsWith(trimmed.slice(0, len))) {
-        return trimmed.slice(len);
+  if (!existingText || !text) return text;
+
+  const isMeaningful = s => s && !/^\s+$/.test(s);
+
+  // 2. 精确末尾重叠（2~400 字，拒绝纯空白误剥）
+  const maxCheck = Math.min(400, existingText.length, text.length);
+  for (let len = maxCheck; len >= 2; len--) {
+    const candidate = text.slice(0, len);
+    if (isMeaningful(candidate) && existingText.endsWith(candidate)) {
+      return text.slice(len);
+    }
+  }
+
+  // 3. 容忍前文末尾带换行或续写开头多出换行后的 3~400 字重叠
+  const trimmedExisting = existingText.trimEnd();
+  const trimmedRescue = text.replace(/^\s+/, "");
+  if (trimmedExisting && trimmedRescue) {
+    const max2 = Math.min(400, trimmedExisting.length, trimmedRescue.length);
+    const min2 = text.startsWith("\n") && trimmedExisting === existingText ? 3 : 4;
+    for (let len = max2; len >= min2; len--) {
+      const candidate = trimmedRescue.slice(0, len);
+      if (isMeaningful(candidate) && trimmedExisting.endsWith(candidate)) {
+        return trimmedRescue.slice(len);
       }
     }
   }
-  return rescueText;
+  return text;
+}
+
+// 提取原始请求中的辅助工具（如 context），确保 continuation_reply 续写时历史 tool_calls 仍保持合法声明
+function extractAuxToolDeclarations(rawTools) {
+  if (!Array.isArray(rawTools)) return [];
+  const aux = [];
+  for (const item of rawTools) {
+    if (!isObject(item)) continue;
+    if (item.type === "function" && isObject(item.function) && RESERVED_AUX_TOOLS.has(item.function.name)) {
+      aux.push(item);
+      continue;
+    }
+    const decls = item.functionDeclarations ?? item.function_declarations;
+    if (Array.isArray(decls)) {
+      const kept = decls.filter(d => isObject(d) && RESERVED_AUX_TOOLS.has(d.name));
+      if (kept.length > 0) aux.push({ ...item, functionDeclarations: kept });
+    }
+  }
+  return aux;
+}
+
+// 清理原始 messages 中指向旧正文工具的指令（含全量 system、末 4 条任意角色、多模态分片与 tool JSON 任意键值；绝不注入禁工具/JSON 毒化语句）
+function sanitizeOriginalMessagesForContinueRescue(rawMessages, oldToolName) {
+  const cloned = Array.isArray(rawMessages)
+    ? rawMessages.map(m => (isObject(m) ? { ...m } : m))
+    : [];
+  if (!oldToolName || oldToolName === "pg_stream_reply" || oldToolName === "continuation_reply") {
+    return cloned;
+  }
+  const escaped = escapeRegExp(oldToolName);
+  const reTool = new RegExp(`\`?${escaped}\`?`, "g");
+  const tailStart = Math.max(0, cloned.length - 4);
+  for (let i = cloned.length - 1; i >= 0; i--) {
+    const msg = cloned[i];
+    if (!msg) continue;
+    const inTail = i >= tailStart;
+    if (!inTail && msg.role !== "system") continue;
+
+    if (msg.role === "tool" && typeof msg.content === "string" && msg.content.includes(oldToolName)) {
+      let handledJson = false;
+      try {
+        const parsed = JSON.parse(msg.content);
+        if (isObject(parsed)) {
+          let changed = false;
+          const next = { ...parsed };
+          for (const [k, v] of Object.entries(next)) {
+            if (typeof v === "string" && v.includes(oldToolName)) {
+              next[k] = v.replace(reTool, "`continuation_reply`");
+              changed = true;
+            }
+          }
+          if (changed) cloned[i] = { ...msg, content: JSON.stringify(next) };
+          handledJson = true;
+        }
+      } catch {
+        // fallback below
+      }
+      if (!handledJson) {
+        cloned[i] = { ...msg, content: msg.content.replace(reTool, "`continuation_reply`") };
+      }
+      continue;
+    }
+
+    if (typeof msg.content === "string" && msg.content.includes(oldToolName)) {
+      cloned[i] = { ...msg, content: msg.content.replace(reTool, "`continuation_reply`") };
+    } else if (Array.isArray(msg.content)) {
+      let changed = false;
+      const nextParts = msg.content.map(part => {
+        if (part?.type === "text" && typeof part.text === "string" && part.text.includes(oldToolName)) {
+          changed = true;
+          return { ...part, text: part.text.replace(reTool, "`continuation_reply`") };
+        }
+        return part;
+      });
+      if (changed) cloned[i] = { ...msg, content: nextParts };
+    }
+  }
+  return cloned;
 }
 
 // 构造截断无感接力请求体（走原生 functionCall 抗截断通道，彻底规避 PROHIBITED_CONTENT 输出截断）
@@ -949,10 +1116,18 @@ export function buildRescueRequestBody(prepared, settings, rescueCtx = {}) {
   delete base.response_schema;
   base.stream = true;
 
-  // 若用户思考强度为 preset 且模型为 Gemini 4，接力阶段默认用 low 提速（实测 65s 稳出 3200+ 字）
+  // 清理 custom_exclude_body 中的 generationConfig / tools / toolConfig，防止 TT 抹杀接力工具与配置
+  if (base.custom_exclude_body !== undefined) {
+    const cleanedEx = stripGenerationConfigFromExclude(base.custom_exclude_body, ["tools", "toolConfig", "tool_config", "tool_choice"]);
+    base.custom_exclude_body = cleanedEx.value;
+  }
+
+  // Gemini 4 接力思考策略：
+  // 1) continue 半句续写（主请求已完成思考）一律强制 low 提速，避免 90k+ 上下文二次长思超时报 503；
+  // 2) full-fallback（0 字重发）除非用户在插件显式锁了 high，否则同样用 low 提速。
   const model = String(base.model ?? "");
   const effort = settings?.thinkingEffort || "preset";
-  if (effort === "preset" && GEMINI_4_RE.test(model)) {
+  if (GEMINI_4_RE.test(model) && (mode === "continue" || effort !== "high")) {
     const res = transformCustomIncludeBody(base.custom_include_body, {
       stripConflictingKeys: true,
       setReasoningKey: "reasoningEffort",
@@ -968,19 +1143,29 @@ export function buildRescueRequestBody(prepared, settings, rescueCtx = {}) {
     base.custom_include_body = res.value;
   }
 
-  // 模式 A：0 字拦截全量回退——直接保留原始预设工具（soliumbra_reply / response_body / ryza_reply）走原生 functionCall
+  // 模式 A：0 字拦截 / 仅吐思考未进正文 全量回退——保留原始预设工具（soliumbra_reply / response_body / ryza_reply）走原生 functionCall
   if (mode === "full-fallback" && Array.isArray(base.tools) && base.tools.length > 0) {
+    const targetName = prepared.target?.toolName || "";
+    const fns = listFunctionTools(base.tools);
+    if (targetName && fns.some(fn => fn.name === targetName)) {
+      base.tool_choice = { type: "function", function: { name: targetName } };
+      base.toolConfig = {
+        functionCallingConfig: {
+          mode: "ANY",
+          allowedFunctionNames: [targetName],
+        },
+      };
+      delete base.tool_config;
+    }
     return {
       body: base,
-      rescueToolName: prepared.target?.toolName || "",
+      rescueToolName: targetName,
       rescueTarget: prepared.target,
     };
   }
 
-  // 模式 B：半句截断无缝续写——用通用 continuation_reply functionCall 接力续完剩余正文与全部后续栏目
-  const toolDesc = prepared.target?.description
-    ? `${prepared.target.description}\n\n【接力续写任务】严格紧接前文中断处续写剩余内容、闭合未完成标签并补全所有要求的后续栏目与变量更新，严禁重复前文。`
-    : "无缝续写上方被中断的完整回复剩余部分（仅包含从中断处接着往下写的新增内容，不要重复前文）。";
+  // 模式 B：半句截断无缝续写——基于干净的 originalWorkingBody.messages（绝不混入 JSON 改写毒化指令）
+  const toolDesc = "无缝续写上方被中断的完整回复剩余部分：严格紧接前文中断处继续写完剩余正文、自然闭合所有未完成标签，并补全所有要求的选项、摘要、评论与变量更新。严禁重复前文已输出的任何内容。";
 
   const tailSnippet = collectedText.slice(-36).replace(/\r?\n/g, " ");
   let tagHint = "";
@@ -998,14 +1183,15 @@ export function buildRescueRequestBody(prepared, settings, rescueCtx = {}) {
     tagHint = "请直接紧接中断字句续写完剩余正文，自然闭合所有未闭合标签，并完整输出所有要求的后续栏目与变量更新。";
   }
 
-  const baseMessages = Array.isArray(prepared.body?.messages)
-    ? prepared.body.messages.map(m => (isObject(m) ? { ...m } : m))
-    : Array.isArray(base.messages)
-      ? base.messages.map(m => (isObject(m) ? { ...m } : m))
-      : [];
+  const baseMessages = sanitizeOriginalMessagesForContinueRescue(base.messages, prepared.target?.toolName);
 
   if (collectedText) {
-    baseMessages.push({ role: "assistant", content: collectedText });
+    const lastMsg = baseMessages.at(-1);
+    if (prepared.continuation && lastMsg?.role === "assistant" && !Array.isArray(lastMsg.tool_calls) && typeof lastMsg.content === "string") {
+      baseMessages[baseMessages.length - 1] = { ...lastMsg, content: lastMsg.content + collectedText };
+    } else {
+      baseMessages.push({ role: "assistant", content: collectedText });
+    }
   }
   const rescuePrompt = reason === "MISSING_BODY_STOP"
     ? `上方回复仅输出了思考规划便提前结束了。请立即调用 \`continuation_reply\` 工具，把完整的正式正文与所有后续栏目写入 \`content\` 参数中。${tagHint}`
@@ -1017,24 +1203,32 @@ export function buildRescueRequestBody(prepared, settings, rescueCtx = {}) {
     content: rescuePrompt,
   });
 
+  // 续写阶段封顶 max_tokens 为 16384，防止 65535 下模型陷入万字复读暴走拖垮 600s 上游超时
+  const curMax = Number(base.max_tokens);
+  base.max_tokens = Number.isFinite(curMax) && curMax > 0 ? Math.min(curMax, 16384) : 16384;
+
   base.messages = baseMessages;
-  base.tools = [{
-    type: "function",
-    function: {
-      name: "continuation_reply",
-      description: toolDesc,
-      parameters: {
-        type: "object",
-        properties: {
-          content: {
-            type: "string",
-            description: "紧接前文中断处的新增续写全文、未闭合标签收尾以及全部后续栏目与变量更新。",
+  const auxTools = extractAuxToolDeclarations(base.tools);
+  base.tools = [
+    ...auxTools,
+    {
+      type: "function",
+      function: {
+        name: "continuation_reply",
+        description: toolDesc,
+        parameters: {
+          type: "object",
+          properties: {
+            content: {
+              type: "string",
+              description: "紧接前文中断处的新增续写全文、未闭合标签收尾以及全部后续栏目与变量更新。",
+            },
           },
+          required: ["content"],
         },
-        required: ["content"],
       },
     },
-  }];
+  ];
   base.tool_choice = { type: "function", function: { name: "continuation_reply" } };
   base.toolConfig = {
     functionCallingConfig: {
