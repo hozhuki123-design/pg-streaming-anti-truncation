@@ -1194,4 +1194,55 @@ async function readRestoredSse(response) {
   console.log("[PASS] 39. v1.4.0 EOF without finishReason after think_nya closes tag and rescues body");
 }
 
-console.log("\nALL 39 TEST SUITES PASSED!");
+// 40. v1.4.1 Preset reasoning_effort ('low'/'min') auto-bridges to Gemini 4 custom_include_body even after Meowssiah deletes request.reasoning_effort
+{
+  const prep = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ type: "function", function: { name: "soliumbra_reply", parameters: { type: "object", properties: { think_nya: { type: "string" }, game_content: { type: "string" } } } } }],
+  }, { ...DEFAULT_SETTINGS, thinkingEffort: "preset" }, null, { hostReasoningEffort: "low" });
+  assert.equal(prep.thinkingApplied, "low");
+  assert.deepEqual(JSON.parse(prep.body.custom_include_body), { reasoningEffort: "low" });
+
+  // Also works in native-fc mode!
+  const prepFc = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ type: "function", function: { name: "soliumbra_reply", parameters: { type: "object", properties: { game_content: { type: "string" } } } } }],
+  }, { ...DEFAULT_SETTINGS, mode: "native-fc", thinkingEffort: "preset" }, null, { hostReasoningEffort: "min" });
+  assert.equal(prepFc.bypass, "native-fc-mode");
+  assert.equal(prepFc.thinkingApplied, "low");
+  assert.equal(prepFc.thinkingDowngradedFrom, "minimal");
+  assert.deepEqual(JSON.parse(prepFc.preprocessedBody.custom_include_body), { reasoningEffort: "low" });
+  console.log("[PASS] 40. v1.4.1 Preset reasoning_effort auto-bridges to Gemini 4 (streaming & native-fc)");
+}
+
+// 41. v1.4.1 Preset bridge respects explicit custom_include_body reasoning key and ignores 'auto'
+{
+  const withCustom = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    custom_include_body: "reasoning_effort: none",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ type: "function", function: { name: "response_body", parameters: { type: "object", properties: { content: { type: "string" } } } } }],
+  }, { ...DEFAULT_SETTINGS, thinkingEffort: "preset" }, null, { hostReasoningEffort: "low" });
+  assert.equal(withCustom.thinkingApplied, null, "must NOT overwrite explicit custom_include_body reasoning key");
+  assert.ok(withCustom.body.custom_include_body.includes("reasoning_effort: none"));
+
+  const withAuto = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-carbon",
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{ type: "function", function: { name: "soliumbra_reply", parameters: { type: "object", properties: { game_content: { type: "string" } } } } }],
+  }, { ...DEFAULT_SETTINGS, thinkingEffort: "preset" }, null, { hostReasoningEffort: "auto" });
+  assert.equal(withAuto.thinkingApplied, null, "auto must not inject reasoningEffort");
+  console.log("[PASS] 41. v1.4.1 Preset bridge preserves explicit custom_include_body & ignores auto");
+}
+
+console.log("\nALL 41 TEST SUITES PASSED!");

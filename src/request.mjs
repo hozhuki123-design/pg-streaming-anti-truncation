@@ -394,18 +394,42 @@ export function stripGenerationConfigFromExclude(raw) {
   return { value: raw, changed: false };
 }
 
-// 公共前置预处理：安全应用 PG 思考档位 + 修正 17 预设 max 400 + 65536 上限保护
+function customIncludeHasReasoningKey(raw) {
+  const state = parseCustomInclude(raw);
+  if (state.format === "json" || state.format === "object") {
+    return Object.keys(state.obj).some(k => REASONING_KEYS.has(k));
+  }
+  if (state.format === "yaml" || state.format === "yaml-list") {
+    return state.blocks.some(b => b.key && REASONING_KEYS.has(b.key));
+  }
+  return false;
+}
+
+function mapHostReasoningToGemini4(raw) {
+  if (typeof raw !== "string") return null;
+  const low = raw.trim().toLowerCase();
+  if (!low || low === "auto" || low === "none" || low === "off" || low === "default") return null;
+  if (low === "min" || low === "minimal") return { effort: "low", downgradedFrom: "minimal" };
+  if (low === "low") return { effort: "low", downgradedFrom: null };
+  if (low === "medium" || low === "med") return { effort: "medium", downgradedFrom: null };
+  if (low === "high" || low === "max" || low === "xhigh" || low === "extra_high" || low === "maximum") {
+    return { effort: "high", downgradedFrom: null };
+  }
+  return null;
+}
+
+// 公共前置预处理：安全应用 PG 思考档位 + 自动桥接被预设脚本(如 Meowssiah)删掉的酒馆原生思考档位 + 修正 max 400 + 65536 上限保护
 // 对 quiet/impersonate/并发后台请求仅执行防 400 修正（max->high 与 65535 上限），不覆盖用户思考档位。
-export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = false } = {}) {
+export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = false, hostReasoningEffort = null } = {}) {
   if (!body || body.chat_completion_source !== "makersuite") {
-    return { body, modified: false, thinkingApplied: null, thinkingDowngradedFrom: null, fixedMaxReasoning: false };
+    return { body, modified: false, thinkingApplied: null, thinkingDowngradedFrom: null, thinkingFromPreset: false, fixedMaxReasoning: false };
   }
   const model = String(body.model ?? "");
   if (!/^(?:models\/)?gemini-[\w.-]+$/i.test(model) || /image|embedding|tts|veo/i.test(model)) {
-    return { body, modified: false, thinkingApplied: null, thinkingDowngradedFrom: null, fixedMaxReasoning: false };
+    return { body, modified: false, thinkingApplied: null, thinkingDowngradedFrom: null, thinkingFromPreset: false, fixedMaxReasoning: false };
   }
   if (settings.onlyReverseProxy && !body.reverse_proxy) {
-    return { body, modified: false, thinkingApplied: null, thinkingDowngradedFrom: null, fixedMaxReasoning: false };
+    return { body, modified: false, thinkingApplied: null, thinkingDowngradedFrom: null, thinkingFromPreset: false, fixedMaxReasoning: false };
   }
 
   const isSilentType = crashFixOnly || body.type === "quiet" || body.type === "impersonate";
@@ -417,6 +441,7 @@ export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = 
   let modified = false;
   let thinkingApplied = null;
   let thinkingDowngradedFrom = null;
+  let thinkingFromPreset = false;
   let fixedMaxReasoning = false;
 
   // 1. 思考档位双轨路由
@@ -464,13 +489,37 @@ export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = 
       }
       thinkingApplied = effort;
     }
-  } else if (nextBody.custom_include_body !== undefined) {
-    // 跟随预设默认（含 quiet/测试连接）：自动修正 17 个本机预设里的 reasoning_effort: max -> high，避免 aistudio-api 400
-    const res = transformCustomIncludeBody(nextBody.custom_include_body, { sanitizeMaxReasoning: true });
-    if (res.changed) {
-      nextBody.custom_include_body = res.value;
-      modified = true;
-      fixedMaxReasoning = true;
+  } else {
+    if (nextBody.custom_include_body !== undefined) {
+      // 跟随预设默认（含 quiet/测试连接）：自动修正 17 个本机预设里的 reasoning_effort: max -> high，避免 aistudio-api 400
+      const res = transformCustomIncludeBody(nextBody.custom_include_body, { sanitizeMaxReasoning: true });
+      if (res.changed) {
+        nextBody.custom_include_body = res.value;
+        modified = true;
+        fixedMaxReasoning = true;
+      }
+    }
+    // 针对 Gemini 4：若用户选“跟随预设默认”，且 custom_include_body 未显式指定思考强度，
+    // 自动把酒馆预设里的 reasoning_effort（如 Meowssiah 的 low，原本会被其脚本删掉且被 TT 忽略）桥接为 reasoningEffort！
+    if (!isSilentType && GEMINI_4_RE.test(model) && !customIncludeHasReasoningKey(nextBody.custom_include_body)) {
+      const bridged = mapHostReasoningToGemini4(nextBody.reasoning_effort ?? hostReasoningEffort);
+      if (bridged) {
+        const res = transformCustomIncludeBody(nextBody.custom_include_body, {
+          setReasoningKey: "reasoningEffort",
+          setReasoningValue: bridged.effort,
+        });
+        if (res.changed) {
+          nextBody.custom_include_body = res.value;
+          modified = true;
+        }
+        if (nextBody.reasoning_effort !== undefined) {
+          delete nextBody.reasoning_effort;
+          modified = true;
+        }
+        thinkingApplied = bridged.effort;
+        thinkingDowngradedFrom = bridged.downgradedFrom;
+        thinkingFromPreset = true;
+      }
     }
   }
 
@@ -481,7 +530,7 @@ export function applyMakerSuitePreprocess(body, settings = {}, { crashFixOnly = 
     modified = true;
   }
 
-  return { body: nextBody, modified, thinkingApplied, thinkingDowngradedFrom, fixedMaxReasoning };
+  return { body: nextBody, modified, thinkingApplied, thinkingDowngradedFrom, thinkingFromPreset, fixedMaxReasoning };
 }
 
 function hasAssistantPrefill(messages) {
@@ -727,7 +776,8 @@ function rewriteContinuationMessages(messages, originalToolName) {
 
 export function preparePgRequest(body, settings, tagStop = null, runtimeOptions = {}) {
   const isBackground = Boolean(runtimeOptions.isBackground);
-  const pre = applyMakerSuitePreprocess(body, settings, { crashFixOnly: isBackground });
+  const hostReasoningEffort = runtimeOptions.hostReasoningEffort ?? null;
+  const pre = applyMakerSuitePreprocess(body, settings, { crashFixOnly: isBackground, hostReasoningEffort });
   const workingBody = pre.body;
 
   if (isBackground) {

@@ -283,7 +283,14 @@ async function sendModifiedBody(originalFetch, input, init, url, payloadText) {
   return originalFetch(input, { ...init, body: payloadText });
 }
 
-// 在模块加载阶段即包裹 window.fetch（loading_order: 5，早于小白X、JS-Slash-Runner 与预设脚本）
+function readHostReasoningEffort() {
+  const sel = document.getElementById("openai_reasoning_effort");
+  const fromDom = typeof sel?.value === "string" && sel.value ? sel.value : null;
+  const fromSettings = SillyTavern.getContext()?.chatCompletionSettings?.reasoning_effort;
+  return fromDom ?? (typeof fromSettings === "string" ? fromSettings : null);
+}
+
+// 在模块加载阶段即包裹 window.fetch（loading_order: 0，早于 SPreset、小白X、JS-Slash-Runner 与预设脚本）
 function installFetchInterceptor() {
   if (window[FETCH_KEY]) return;
   const originalFetch = window.fetch.bind(window);
@@ -312,7 +319,8 @@ function installFetchInterceptor() {
 
     const isBackground = isLikelyBackgroundRequest(body);
     const tagStop = readTagStopRule(s);
-    const prepared = preparePgRequest(body, s, tagStop, { isBackground });
+    const hostReasoningEffort = readHostReasoningEffort();
+    const prepared = preparePgRequest(body, s, tagStop, { isBackground, hostReasoningEffort });
 
     // 静默后台请求（quiet / 替我说 / 并发扩展任务）：绝不写状态栏、绝不改工具，仅静默透传防 400 修正
     if (prepared.silent) {
@@ -468,8 +476,11 @@ function installFetchInterceptor() {
               return;
             }
             const sec = Math.max(1, Math.floor((performance.now() - rescueStart) / 1000));
-            setStatus(`${modeDesc}（已等待 ${sec} 秒）…`, "warn", reqId);
-            setRescuePill(`${pillPrefix}（已等 ${sec} 秒）…`, reqId);
+            const slowTip = sec >= 120 && rescueCtx.collectedText?.length > 0
+              ? "（等待较久，可点停止保留已出正文再点继续）"
+              : "";
+            setStatus(`${modeDesc}（已等待 ${sec} 秒）${slowTip}…`, "warn", reqId);
+            setRescuePill(`${pillPrefix}（已等 ${sec} 秒${sec >= 120 && rescueCtx.collectedText?.length > 0 ? "，可停止后点继续" : ""}）…`, reqId);
           }, 1000);
           try {
             const built = buildRescueRequestBody(prepared, s, rescueCtx);
@@ -626,8 +637,12 @@ function updatePresetHint() {
   } else {
     const modelSel = document.getElementById("model_google_select");
     const curModel = String(modelSel?.value ?? SillyTavern.getContext().chatCompletionSettings?.google_model ?? "");
+    const hostEff = String(readHostReasoningEffort() ?? "").trim().toLowerCase();
+    const hasLowPreset = hostEff === "low" || hostEff === "min" || hostEff === "minimal";
     const carbonTip = /gemini-4-carbon/i.test(curModel)
-      ? " 提示：长对话用 4c 时建议把「PG 思考强度」改为「低思考」，可避免首字干等超时。"
+      ? (hasLowPreset
+        ? " 已自动桥接预设里的「低思考」到 Gemini 4，防止被脚本吞掉。"
+        : " 提示：长对话用 4c 时建议开启「低思考」，可避免首字干等超时。")
       : "";
     text = (s.autoRescue !== false
       ? "就绪：真流式秒出字，如遇安全截断或仅出思维链假停，将自动切原生函数通道无感补全。"
