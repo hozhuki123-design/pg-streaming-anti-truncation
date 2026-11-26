@@ -799,6 +799,24 @@ export class PgJsonRestorer {
     if (role === "plan") return { openFieldKey: key, openWrapperTag: key };
     return { openFieldKey: key, openWrapperTag: field.style === "wrap" ? key : null };
   }
+
+  // 检查结构化回复是否“只吐了思考规划、正文主体字段完全为空”（Gemini 4 高尺度静默假 STOP 典型症状）
+  isMissingBody() {
+    if (this.parser.mode === "passthrough") return false;
+    if (this.target.kind === "soliumbra") {
+      const schemaKeys = Object.keys(this.target.schema?.properties ?? {});
+      const bodyKeys = schemaKeys.filter(k => k === "game_content" || k === "game" || k === "story_body");
+      if (bodyKeys.length === 0) return false;
+      return bodyKeys.every(k => !(this.fields.get(k)?.raw?.trim()));
+    }
+    if (this.target.kind === "multi-field") {
+      const schemaKeys = Object.keys(this.target.schema?.properties ?? {});
+      const bodyKeys = schemaKeys.filter(k => classifyMultiFieldRole(k) === "body");
+      if (bodyKeys.length === 0) return false;
+      return bodyKeys.every(k => !(this.fields.get(k)?.raw?.trim()));
+    }
+    return false;
+  }
 }
 
 // 把原生 functionCall 返回的参数还原为与流式一致的最终正文文本
@@ -996,6 +1014,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
   let lastProgressAt = 0;
   let pendingRescue = null;
   let rescuedCount = 0;
+  let finishFrameEmitted = false;
 
   const reportDone = (extra = {}) => {
     if (doneReported) return;
@@ -1102,6 +1121,9 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
 
       let piece = rescued.text || "";
       if (stop && piece) piece = stop.clip(piece);
+      if (ctx.reason === "MISSING_BODY_STOP" && piece && collectedText && !collectedText.endsWith("\n") && !piece.startsWith("\n")) {
+        piece = `\n${piece}`;
+      }
       if (piece) {
         markFirstText();
         collectedText += piece;
@@ -1264,6 +1286,24 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
         chunksEmitted++;
         outParts.push({ text: tail });
       }
+
+      // Gemini 4 高尺度静默假 STOP（只吐思维链/思考块、正文完全 0 字却报 finishReason=STOP）：
+      // 自动切原生 functionCall 接力补全正文，彻底解决“出完思维链就没了”！
+      if (canRescue && rescuedCount < MAX_RESCUES && reason === "STOP" && !errorMessage && !blockReason) {
+        const missingAll = collectedText.trim().length === 0;
+        const missingBody = !missingAll && restorer.isMissingBody();
+        if (missingAll || missingBody) {
+          if (outParts.length > 0) {
+            emit(sseData({
+              candidates: [{ index: candidate?.index ?? 0, content: { role: "model", parts: outParts } }],
+            }));
+          }
+          pendingRescue = missingAll
+            ? { mode: "full-fallback", reason: "EMPTY_STOP" }
+            : { mode: "continue", reason: "MISSING_BODY_STOP" };
+          return false;
+        }
+      }
     }
 
     if (stop?.marker()) {
@@ -1279,6 +1319,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
     }
 
     if (outParts.length > 0 || reason || parsed.usageMetadata) {
+      if (reason && reason !== "FINISH_REASON_UNSPECIFIED") finishFrameEmitted = true;
       const outFrame = {
         candidates: [{
           index: candidate?.index ?? 0,
@@ -1296,6 +1337,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
     const encoder = new TextEncoder();
     const reader = response.body.getReader();
     let streamController = null;
+    let sseParser = null;
     let stopped = false;
     let doneEmitted = false;
     let closed = false;
@@ -1339,8 +1381,8 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
           if (text.includes("data: [DONE]")) doneEmitted = true;
           controller.enqueue(encoder.encode(text));
         };
-        if (!this._parser) {
-          this._parser = createSseParser(ev => {
+        if (!sseParser) {
+          sseParser = createSseParser(ev => {
             if (handleEvent(ev, emit) === false) {
               stopped = true;
               return false;
@@ -1355,19 +1397,35 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
               return;
             }
             if (done) {
-              this._parser.finish();
-              if (pendingRescue && !closed) {
-                await runRescueLoop(emit, true);
-                if (!doneEmitted && !closed) emit(sseData("[DONE]"));
-                reportDone(stop?.marker() ? { stoppedByTag: stop.marker() } : {});
-              } else if (!stopped && !closed) {
+              sseParser.finish();
+              if (!pendingRescue && !stopped && !closed) {
                 const tail = restorer.finish();
                 if (tail) {
                   markFirstText();
                   collectedText += tail;
                   chunksEmitted++;
                   emit(sseData({
-                    candidates: [{ index: 0, content: { role: "model", parts: [{ text: tail }] }, finishReason: finalFinishReason }],
+                    candidates: [{ index: 0, content: { role: "model", parts: [{ text: tail }] } }],
+                  }));
+                }
+                if (canRescue && rescuedCount < MAX_RESCUES && !errorMessage && !blockReason && !stop?.marker()) {
+                  if (collectedText.trim().length === 0) {
+                    pendingRescue = { mode: "full-fallback", reason: "EMPTY_STOP" };
+                  } else if (restorer.isMissingBody()) {
+                    pendingRescue = { mode: "continue", reason: "MISSING_BODY_STOP" };
+                  }
+                }
+              }
+              if (pendingRescue && !closed) {
+                await runRescueLoop(emit, true);
+                if (!doneEmitted && !closed) emit(sseData("[DONE]"));
+                reportDone(stop?.marker() ? { stoppedByTag: stop.marker() } : {});
+              } else if (!stopped && !closed) {
+                if (!finishFrameEmitted) {
+                  finishFrameEmitted = true;
+                  emit(sseData({
+                    candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: finalFinishReason }],
+                    ...(usageMetadata ? { usageMetadata } : {}),
                   }));
                 }
                 if (!doneEmitted) emit(sseData("[DONE]"));
@@ -1377,7 +1435,7 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
               closeStreamSafely();
               return;
             }
-            this._parser.push(value);
+            sseParser.push(value);
             if (pendingRescue && !closed) {
               await reader.cancel().catch(() => {});
               await runRescueLoop(emit, true);
@@ -1456,14 +1514,22 @@ export async function restorePgResponse(response, prepared, signal, onProgress =
       }
     }
     parser.finish();
-    if (pendingRescue) {
-      await runRescueLoop(noopEmit, false);
-    } else {
+    if (!pendingRescue) {
       const tail = restorer.finish();
       if (tail) {
         markFirstText();
         collectedText += tail;
       }
+      if (canRescue && rescuedCount < MAX_RESCUES && !errorMessage && !blockReason && !stop?.marker()) {
+        if (collectedText.trim().length === 0) {
+          pendingRescue = { mode: "full-fallback", reason: "EMPTY_STOP" };
+        } else if (restorer.isMissingBody()) {
+          pendingRescue = { mode: "continue", reason: "MISSING_BODY_STOP" };
+        }
+      }
+    }
+    if (pendingRescue) {
+      await runRescueLoop(noopEmit, false);
     }
   } catch (err) {
     if (signal?.aborted || err?.name === "AbortError") {

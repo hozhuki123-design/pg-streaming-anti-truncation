@@ -1,9 +1,16 @@
-import { BODY_LIMIT, VALID_THINKING_EFFORTS, preparePgRequest, buildRescueRequestBody, dedupeContinuationOverlap } from "./src/request.mjs";
+import {
+  BODY_LIMIT,
+  VALID_THINKING_EFFORTS,
+  resolveLocalGenerateUrl,
+  hasPresetReplyTool,
+  preparePgRequest,
+  buildRescueRequestBody,
+  dedupeContinuationOverlap,
+} from "./src/request.mjs";
 import { restorePgResponse, readRescueFunctionResponse } from "./src/json-stream.mjs";
 import { installPgMeowPreview } from "./src/meow-preview.mjs";
 
 const PLUGIN_ID = "pg-streaming-anti-truncation";
-const GENERATE_PATH = "/api/backends/chat-completions/generate";
 const FETCH_KEY = Symbol.for("pg-streaming-anti-truncation.fetch");
 
 const TAG_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.:~-]{0,63}$/;
@@ -63,6 +70,8 @@ const BLOCK_REASON_CN = {
   RECITATION: "触发版权复述保护",
   SPII: "触发敏感隐私保护",
   IMAGE_SAFETY: "触发图像安全过滤",
+  EMPTY_STOP: "上游静默空回（仅思考或 0 字结束）",
+  MISSING_BODY_STOP: "上游仅输出思维链未写正文",
   OTHER: "上游异常中止",
   BLOCKED: "触发上游安全拦截",
 };
@@ -91,7 +100,7 @@ let activeMainReqId = 0;
 let inFlightMainReqId = null;
 let inFlightMainSignal = null;
 let stopActiveWaitTimer = null;
-let mainGenActive = null; // null = 宿主尚未触发生成事件（回退兼容模式），true/false = 实时追踪主生成态
+let lastStatus = { text: "", tone: "info" };
 let globalListenersBound = false;
 
 function ensureMeowPreview() {
@@ -133,10 +142,11 @@ function getLiveStatusEl() {
 
 function setStatus(text, tone = "info", reqId = null) {
   if (reqId !== null && reqId !== activeMainReqId) return;
+  lastStatus = { text: text || "", tone };
   const el = getLiveStatusEl();
   if (!el) return;
-  el.textContent = text || "";
-  el.hidden = !text;
+  el.textContent = lastStatus.text;
+  el.hidden = !lastStatus.text;
   el.classList.toggle("pg-status-error", tone === "error" || tone === true);
   el.classList.toggle("pg-status-warn", tone === "warn");
 }
@@ -215,22 +225,40 @@ function readTagStopRule(s) {
 
 // 判别是否为非 quiet 的后台扩展请求（如记忆增强 generateRaw、小白X后台辅助调用）：
 // 1) 若旧主请求仍在进行且未被手动中止，并发进入的次级请求 100% 为后台请求；
-// 2) 主生成已结束（mainGenActive === false）且无活跃 streamingProcessor 时，后台扩展（如记忆填表）请求直接放行；
-// 3) 首次主聊天前（mainGenActive !== true），无 streamingProcessor、无 type、stream === false 而宿主开启流式的请求视作后台调用（如小白X）。
+// 2) 无活跃 streamingProcessor、无 type、stream === false 而宿主开启流式、且未携带正文工具（如 soliumbra_reply）的请求视作后台调用；
+// 注：绝不能因历史 quiet 任务触发过 GENERATION_ENDED 就误判后续主生成为后台请求（修复手机端静默漏拦截）。
 function isLikelyBackgroundRequest(body) {
   if (body.type === "quiet" || body.type === "impersonate") return false; // 由专门分支处理
   if (inFlightMainReqId !== null && !inFlightMainSignal?.aborted) return true;
+  if (body.stream === true || hasPresetReplyTool(body)) return false;
   const ctx = SillyTavern.getContext();
   const activeProc = Boolean(ctx?.streamingProcessor && !ctx.streamingProcessor.isFinished);
-  if (mainGenActive === false && !activeProc) return true;
   const hostStreamEl = document.getElementById("stream_toggle");
   const hostStreaming = hostStreamEl
     ? hostStreamEl.checked
     : ctx?.chatCompletionSettings?.stream_openai !== false;
-  if (mainGenActive !== true && !activeProc && !body.type && body.stream === false && hostStreaming) {
+  if (!activeProc && !body.type && body.stream === false && hostStreaming) {
     return true;
   }
   return false;
+}
+
+async function readRequestBodyJson(input, init) {
+  const raw = init?.body;
+  if (typeof raw === "string") return JSON.parse(raw);
+  if (raw instanceof ArrayBuffer) {
+    return JSON.parse(new TextDecoder().decode(new Uint8Array(raw)));
+  }
+  if (ArrayBuffer.isView(raw)) {
+    return JSON.parse(new TextDecoder().decode(raw));
+  }
+  if (typeof Blob !== "undefined" && raw instanceof Blob) {
+    return JSON.parse(await raw.text());
+  }
+  if (raw == null && input instanceof Request) {
+    return await input.clone().json();
+  }
+  return null;
 }
 
 async function sendModifiedBody(originalFetch, input, init, url, payloadText) {
@@ -266,24 +294,14 @@ function installFetchInterceptor() {
       return originalFetch(input, init);
     }
 
-    let url;
-    try {
-      url = new URL(typeof input === "string" || input instanceof URL ? input : input.url, location.origin);
-    } catch {
-      return originalFetch(input, init);
-    }
-    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
-    if (url.origin !== location.origin || url.pathname !== GENERATE_PATH || method !== "POST") {
+    const url = resolveLocalGenerateUrl(input, init, globalThis.location?.href);
+    if (!url) {
       return originalFetch(input, init);
     }
 
     let body;
     try {
-      body = typeof init?.body === "string"
-        ? JSON.parse(init.body)
-        : init?.body == null && input instanceof Request
-          ? await input.clone().json()
-          : null;
+      body = await readRequestBodyJson(input, init);
     } catch {
       return originalFetch(input, init);
     }
@@ -431,11 +449,17 @@ function installFetchInterceptor() {
           stopRescueTimer();
           const rescueStart = performance.now();
           const modeDesc = rescueCtx.mode === "full-fallback"
-            ? "0 字拦截，自动回退原生函数抗截断通道"
-            : `检测到上游安全截断（已收 ${rescueCtx.collectedText.length} 字），正在原生函数通道无感接力续写`;
+            ? (rescueCtx.reason === "EMPTY_STOP"
+              ? "上游仅思考未出正文（假 STOP），自动切换原生函数抗截断通道补发"
+              : "0 字拦截，自动回退原生函数抗截断通道")
+            : rescueCtx.reason === "MISSING_BODY_STOP"
+              ? "上游仅输出思维链未写正文，正在原生函数通道无感补写完整正文"
+              : `检测到上游安全截断（已收 ${rescueCtx.collectedText.length} 字），正在原生函数通道无感接力续写`;
           const pillPrefix = rescueCtx.mode === "full-fallback"
             ? "防截断通道生成中"
-            : "触发安全截断，正在无感接力续写";
+            : rescueCtx.reason === "MISSING_BODY_STOP"
+              ? "仅出思维链，正在自动补写正文"
+              : "触发安全截断，正在无感接力续写";
           setStatus(`${modeDesc}…`, "warn", reqId);
           setRescuePill(`${pillPrefix}…`, reqId);
           rescueTimer = setInterval(() => {
@@ -600,9 +624,14 @@ function updatePresetHint() {
   } else if (s.mode === "buffered") {
     text = "就绪：发送时自动识别小猫 / 4ACH / 图灵 / 莱莎等工具预设并转为整段校验抗截断。";
   } else {
-    text = s.autoRescue !== false
-      ? "就绪：真流式秒出字，如遇上游安全截断将自动切原生函数通道无感续完。"
-      : "就绪：发送时自动识别小猫 / 4ACH / 图灵 / 莱莎等工具预设并转为真流式。";
+    const modelSel = document.getElementById("model_google_select");
+    const curModel = String(modelSel?.value ?? SillyTavern.getContext().chatCompletionSettings?.google_model ?? "");
+    const carbonTip = /gemini-4-carbon/i.test(curModel)
+      ? " 提示：长对话用 4c 时建议把「PG 思考强度」改为「低思考」，可避免首字干等超时。"
+      : "";
+    text = (s.autoRescue !== false
+      ? "就绪：真流式秒出字，如遇安全截断或仅出思维链假停，将自动切原生函数通道无感补全。"
+      : "就绪：发送时自动识别小猫 / 4ACH / 图灵 / 莱莎等工具预设并转为真流式。") + carbonTip;
   }
 
   presetHintEl.textContent = text;
@@ -624,13 +653,11 @@ function bindGlobalListenersOnce() {
   if (events?.GENERATION_STARTED) {
     context.eventSource.on(events.GENERATION_STARTED, (type, _opts, dryRun) => {
       if (!dryRun && type !== "quiet" && type !== "impersonate") {
-        mainGenActive = true;
         resetInFlight();
       }
     });
   }
   const endMainGen = () => {
-    mainGenActive = false;
     resetInFlight();
   };
   if (events?.GENERATION_ENDED) context.eventSource.on(events.GENERATION_ENDED, endMainGen);
@@ -771,6 +798,9 @@ function mountPanel() {
   const stopCountEl = panel.querySelector("#pg_stop_count");
   statusEl = panel.querySelector("#pg_streaming_status");
   presetHintEl = panel.querySelector("#pg_preset_hint");
+  if (lastStatus.text) {
+    setStatus(lastStatus.text, lastStatus.tone);
+  }
 
   modeEl.value = s.mode;
   thinkingEl.value = s.thinkingEffort;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { preparePgRequest, transformCustomIncludeBody, stripGenerationConfigFromExclude, buildRescueRequestBody, dedupeContinuationOverlap } from "../src/request.mjs";
+import { preparePgRequest, transformCustomIncludeBody, stripGenerationConfigFromExclude, buildRescueRequestBody, dedupeContinuationOverlap, resolveLocalGenerateUrl, hasPresetReplyTool } from "../src/request.mjs";
 import { restorePgResponse, readRescueFunctionResponse, PgJsonRestorer, StreamingFlatJsonParser, createTagStop, sseData } from "../src/json-stream.mjs";
 import { sanitizeMakerSuiteSchema, detectTransportTarget } from "../src/schema.mjs";
 
@@ -1056,4 +1056,142 @@ async function readRestoredSse(response) {
   console.log("[PASS] 35. v1.3.0 native-fc mode preserves tools with low thinking & crash fix");
 }
 
-console.log("\nALL 35 TEST SUITES PASSED!");
+// 36. v1.4.0 Mobile Tauri v2 URL/origin compatibility (tauri://, https://tauri.localhost, loopback port, opaque origin)
+{
+  const u1 = resolveLocalGenerateUrl("/api/backends/chat-completions/generate", { method: "POST" }, "tauri://localhost/index.html");
+  assert.ok(u1 && u1.pathname === "/api/backends/chat-completions/generate", "must match relative URL under tauri://localhost");
+
+  const u2 = resolveLocalGenerateUrl("http://127.0.0.1:41234/api/backends/chat-completions/generate", { method: "POST" }, "https://tauri.localhost/");
+  assert.ok(u2 && u2.hostname === "127.0.0.1", "must match loopback local backend URL from Android https://tauri.localhost");
+
+  const u3 = resolveLocalGenerateUrl("https://evil.example.com/api/backends/chat-completions/generate", { method: "POST" }, "http://tauri.localhost/");
+  assert.equal(u3, null, "must reject remote non-local origins");
+
+  const u4 = resolveLocalGenerateUrl("/api/backends/chat-completions/generate", { method: "GET" }, "http://tauri.localhost/");
+  assert.equal(u4, null, "must reject non-POST requests");
+
+  assert.equal(hasPresetReplyTool({ tools: [{ type: "function", function: { name: "soliumbra_reply", parameters: { type: "object", properties: {} } } }] }), true);
+  assert.equal(hasPresetReplyTool({ tools: [{ type: "function", function: { name: "context", parameters: { type: "object", properties: {} } } }] }), false);
+  console.log("[PASS] 36. v1.4.0 Mobile Tauri v2 URL/origin matching & preset reply tool detector");
+}
+
+// 37. v1.4.0 Silent empty-body STOP (native thinking ONLY, 0 visible chars, finishReason=STOP) triggers full-fallback rescue
+{
+  const prep = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-neon",
+    stream: true,
+    messages: [{ role: "user", content: "写剧情" }],
+    tools: [{
+      type: "function",
+      function: {
+        name: "soliumbra_reply",
+        parameters: { type: "object", properties: { think_nya: { type: "string" }, game_content: { type: "string" } }, required: ["think_nya", "game_content"] },
+      },
+    }],
+  }, { ...DEFAULT_SETTINGS, autoRescue: true });
+
+  let seenCtx = null;
+  const restored = await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ thought: true, text: "先构思一下剧情走向……" }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 50000, candidatesTokenCount: 364 } },
+    ]),
+    prep,
+    undefined,
+    () => {},
+    async ctx => {
+      seenCtx = ctx;
+      const built = buildRescueRequestBody(prep, DEFAULT_SETTINGS, ctx);
+      assert.equal(built.rescueToolName, "soliumbra_reply");
+      const sse = makeSseResponse([
+        { candidates: [{ index: 0, content: { role: "model", parts: [{ functionCall: { name: "soliumbra_reply", args: { think_nya: "补全思考", game_content: "<game>完整补全的正文</game>" } } }] } }] },
+        { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }] },
+      ]);
+      return readRescueFunctionResponse(sse, built.rescueTarget);
+    },
+  );
+  const out = await readRestoredSse(restored);
+  assert.equal(seenCtx.mode, "full-fallback");
+  assert.equal(seenCtx.reason, "EMPTY_STOP");
+  assert.equal(out.finishReason, "STOP");
+  assert.equal(out.text, "<think_nya>\n补全思考\n</think_nya><!--</think>-->\n<game>完整补全的正文</game>");
+  console.log("[PASS] 37. v1.4.0 Thinking-only silent STOP auto-rescues via full-fallback functionCall");
+}
+
+// 38. v1.4.0 Soliumbra emits ONLY think_nya & 0 game_content with finishReason=STOP -> MISSING_BODY_STOP rescue stitches <game>
+{
+  const prep = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-neon",
+    stream: true,
+    messages: [{ role: "user", content: "继续" }],
+    tools: [{
+      type: "function",
+      function: {
+        name: "soliumbra_reply",
+        parameters: { type: "object", properties: { think_nya: { type: "string" }, game_content: { type: "string" } }, required: ["think_nya", "game_content"] },
+      },
+    }],
+  }, { ...DEFAULT_SETTINGS, autoRescue: true });
+
+  let seenCtx = null;
+  const restored = await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ text: '{"think_nya":"小猫规划完就停了","game_content":""}' }] } }] },
+      { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }] },
+    ]),
+    prep,
+    undefined,
+    () => {},
+    async ctx => {
+      seenCtx = ctx;
+      const built = buildRescueRequestBody(prep, DEFAULT_SETTINGS, ctx);
+      assert.equal(built.rescueToolName, "continuation_reply");
+      assert.ok(built.body.messages.at(-1).content.includes("仅输出了思考规划"), "prompt must instruct model to write missing body");
+      return { text: "<game>\n补写出来的完整正文内容。\n</game>", finishReason: "STOP" };
+    },
+  );
+  const out = await readRestoredSse(restored);
+  assert.equal(seenCtx.mode, "continue");
+  assert.equal(seenCtx.reason, "MISSING_BODY_STOP");
+  assert.equal(out.finishReason, "STOP");
+  assert.equal(out.text, "<think_nya>\n小猫规划完就停了\n</think_nya><!--</think>-->\n<game>\n补写出来的完整正文内容。\n</game>");
+  console.log("[PASS] 38. v1.4.0 Think-only soliumbra STOP auto-rescues missing <game> body");
+}
+
+// 39. v1.4.0 Stream EOF without finishReason after only thinking still auto-rescues cleanly
+{
+  const prep = preparePgRequest({
+    chat_completion_source: "makersuite",
+    model: "gemini-4-neon",
+    stream: true,
+    messages: [{ role: "user", content: "继续" }],
+    tools: [{
+      type: "function",
+      function: {
+        name: "soliumbra_reply",
+        parameters: { type: "object", properties: { think_nya: { type: "string" }, game_content: { type: "string" } }, required: ["think_nya", "game_content"] },
+      },
+    }],
+  }, { ...DEFAULT_SETTINGS, autoRescue: true });
+
+  const restored = await restorePgResponse(
+    makeSseResponse([
+      { candidates: [{ index: 0, content: { role: "model", parts: [{ text: '{"think_nya":"只来得及思考' }] } }] },
+    ]),
+    prep,
+    undefined,
+    () => {},
+    async ctx => {
+      assert.equal(ctx.reason, "MISSING_BODY_STOP");
+      assert.ok(ctx.collectedText.includes("</think_nya><!--</think>-->"), "think_nya must be cleanly closed before body rescue");
+      return { text: "<game>补全正文</game>", finishReason: "STOP" };
+    },
+  );
+  const out = await readRestoredSse(restored);
+  assert.equal(out.text, "<think_nya>\n只来得及思考\n</think_nya><!--</think>-->\n<game>补全正文</game>");
+  console.log("[PASS] 39. v1.4.0 EOF without finishReason after think_nya closes tag and rescues body");
+}
+
+console.log("\nALL 39 TEST SUITES PASSED!");

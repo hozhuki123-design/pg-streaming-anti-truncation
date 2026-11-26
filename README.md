@@ -6,15 +6,15 @@
 
 1. **真流式 + 截断自动无感接力（默认推荐）**
    - 自动将小猫（`Meowssiah` / `soliumbra_reply`）、`4ACH`（`response_body`）、`图灵 4A/4C`（`actual_content`）、`小猫 Reborn`（`game_content`）、《莱莎的秘密工坊》（`ryza_reply`）等阻塞型工具预设转为结构化真流式输出，大幅缩短首字等待时间。
-   - 若高尺度剧情中途触发上游 `PROHIBITED_CONTENT` / `SAFETY` 等安全截断，**不断流、不乱闭合标签**，后台自动切换原生 `functionCall` 抗截断通道无感续写剩余正文与状态栏变量更新，去重拼接回同一条消息，并在聊天右下角弹出轻提示胶囊（电脑与手机端均清晰可见）。
-   - 若开头 0 字即遭 `promptFeedback` 拦截，自动全量回退原始工具通道补发。
+   - 若高尺度剧情中途触发上游 `PROHIBITED_CONTENT` / `SAFETY` 安全截断，或出现 **“只吐思维链、正文 0 字却静默报 `STOP`”**，**不断流、不乱闭合标签**，后台自动切换原生 `functionCall` 抗截断通道无感续写/补全剩余正文与状态栏变量更新，去重拼接回同一条消息，并在聊天右下角弹出轻提示胶囊（电脑与手机端均清晰可见）。
+   - 若开头 0 字即遭 `promptFeedback` 拦截或仅思考空停，自动全量回退原始工具通道补发。
 2. **原生函数抗截断模式**
    - 可随时在「传输模式」切为 **原生函数抗截断（全程防截断 + 思考提速，不流式）**，保留原工具调用并叠加 Gemini 4 思考档位与超限参数修复。
 3. **PG 思考强度双轨控制 & 预设防崩溃保护**
    - 绕过旧版 TauriTavern 对 `gemini-4-*` 思考档位不生效的问题，支持一键设为 **低思考（最快出字，推荐）** / 中 / 高 / 恢复模型默认（对 Gemini 4 自动将不支持的 `minimal` 平滑降档为 `low`）。
    - 自动修正预设附加参数里的 `reasoning_effort: max`（防止反代报 400）及 `max_tokens > 65536`（自动压回 `65535`），完整支持 YAML、JSON 与尾逗号 JSON。
 4. **全场景隔离与兼容**
-   - `loading_order: 5`，与 `vertex-streaming-anti-truncation`、`JS-Slash-Runner`、`LittleWhiteBox`（小白X）、`st-memory-enhancement` 等扩展和平共存、互不干扰。
+   - `loading_order: 0`（兼容手机端 `tauri://` / `tauri.localhost` 与本地回环端口），与 `SPreset`、`vertex-streaming-anti-truncation`、`JS-Slash-Runner`、`LittleWhiteBox`（小白X）、`st-memory-enhancement` 等扩展和平共存、互不干扰。
    - 自动识别并静默放行 `quiet`、`impersonate`、后台记忆/总结并发请求以及末尾助手预填充预设；「继续（Continue）」模式无缝续接不重套思考块。
    - 支持自定义标签截停（含豁免块与 `~` 标签名，如 `konatan_planning~`）。
 

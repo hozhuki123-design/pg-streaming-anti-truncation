@@ -1,6 +1,41 @@
-import { isObject, detectTransportTarget } from "./schema.mjs";
+import { isObject, listFunctionTools, RESERVED_AUX_TOOLS, detectTransportTarget } from "./schema.mjs";
 
 export const BODY_LIMIT = 8 * 1024 * 1024;
+export const GENERATE_PATH = "/api/backends/chat-completions/generate";
+
+const LOCAL_HOST_RE = /^(?:localhost|127\.0\.0\.1|\[::1\]|::1|tauri\.localhost|.+\.tauri\.localhost)$/i;
+
+// 兼容桌面端与手机端 TauriTavern（含 tauri:// / https://tauri.localhost / 本地回环端口跨域）：
+// 使用 location.href 作基准避免不透明 origin ("null") 触发 new URL 抛错导致手机端静默漏拦截。
+export function resolveLocalGenerateUrl(input, init, pageHref = globalThis.location?.href || "http://localhost/") {
+  const rawUrl = typeof input === "string" || input instanceof URL ? String(input) : input?.url;
+  if (!rawUrl) return null;
+  const method = String(init?.method ?? (input && typeof input === "object" ? input.method : null) ?? "GET").toUpperCase();
+  if (method !== "POST") return null;
+  let url;
+  let pageUrl = null;
+  try {
+    pageUrl = new URL(pageHref || "http://localhost/");
+  } catch {
+    pageUrl = new URL("http://localhost/");
+  }
+  try {
+    url = new URL(rawUrl, pageUrl.href);
+  } catch {
+    return null;
+  }
+  if (url.pathname !== GENERATE_PATH) return null;
+  const sameOrigin = url.origin !== "null" && pageUrl.origin !== "null" && url.origin === pageUrl.origin;
+  const sameOpaqueScheme = url.protocol === pageUrl.protocol && url.hostname === pageUrl.hostname && url.port === pageUrl.port;
+  const localHost = LOCAL_HOST_RE.test(url.hostname);
+  if (!sameOrigin && !sameOpaqueScheme && !localHost) return null;
+  return url;
+}
+
+export function hasPresetReplyTool(body) {
+  const fns = listFunctionTools(body?.tools);
+  return fns.some(fn => fn?.name && !RESERVED_AUX_TOOLS.has(fn.name));
+}
 
 export const CONTINUATION_INSTRUCTION =
   "请严格承接上方未写完的回复末尾继续往下写，只输出需要追加的新增内容；严禁重复、总结、重新输出开头的思考块或已打开的外层标签，保持原本的语言、人称、格式并自然收束未闭合标签。";
@@ -851,6 +886,7 @@ export function dedupeContinuationOverlap(existingText, rescueText) {
 export function buildRescueRequestBody(prepared, settings, rescueCtx = {}) {
   const {
     mode = "continue",      // "continue" | "full-fallback"
+    reason = "",
     collectedText = "",
     openFieldKey = "",
     openWrapperTag = null,
@@ -898,7 +934,11 @@ export function buildRescueRequestBody(prepared, settings, rescueCtx = {}) {
 
   const tailSnippet = collectedText.slice(-36).replace(/\r?\n/g, " ");
   let tagHint = "";
-  if (openWrapperTag === "think_nya") {
+  if (reason === "MISSING_BODY_STOP") {
+    tagHint = prepared.target?.kind === "soliumbra"
+      ? "你刚才只完成了 <think_nya> 思考规划，尚未写出正式正文。请直接输出完整的 <game>...</game> 正文以及所有要求的选项、摘要、评论与变量更新，严禁再重复输出 <think_nya> 思考块！"
+      : "你刚才只完成了思考规划，尚未写出正式正文。请直接写出完整正文以及所有要求的后续栏目与变量更新，严禁再重复输出思考块！";
+  } else if (openWrapperTag === "think_nya") {
     tagHint = "当前中断位置正处于 <think_nya> 思考块内部，请先自然收尾思考并输出 </think_nya><!--</think>-->，再紧接写出完整正文与所有后续栏目。";
   } else if (openWrapperTag) {
     tagHint = `当前中断位置正处于 <${openWrapperTag}> 标签内部，请直接续写该块剩余正文并自然闭合 </${openWrapperTag}>，然后输出其余要求的后续栏目与变量更新。`;
@@ -917,9 +957,14 @@ export function buildRescueRequestBody(prepared, settings, rescueCtx = {}) {
   if (collectedText) {
     baseMessages.push({ role: "assistant", content: collectedText });
   }
+  const rescuePrompt = reason === "MISSING_BODY_STOP"
+    ? `上方回复仅输出了思考规划便提前结束了。请立即调用 \`continuation_reply\` 工具，把完整的正式正文与所有后续栏目写入 \`content\` 参数中。${tagHint}`
+    : collectedText
+      ? `上方回复在末尾意外中断（停在「${tailSnippet}」处）。请立即调用 \`continuation_reply\` 工具，把紧接末尾的新增续写内容完整写入 \`content\` 参数中。${tagHint}严禁重复前文已输出的任何字句或开头标签！`
+      : `请立即调用 \`continuation_reply\` 工具，将完整的用户可见回复内容（包含所有要求的标签、正文与后续栏目）完整写入 \`content\` 参数中。`;
   baseMessages.push({
     role: "user",
-    content: `上方回复在末尾意外中断（停在「${tailSnippet}」处）。请立即调用 \`continuation_reply\` 工具，把紧接末尾的新增续写内容完整写入 \`content\` 参数中。${tagHint}严禁重复前文已输出的任何字句或开头标签！`,
+    content: rescuePrompt,
   });
 
   base.messages = baseMessages;
